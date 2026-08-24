@@ -5,6 +5,9 @@ if(WITH_ZSET_STORAGE_ENGINE AND NOT WITHOUT_ZSET_STORAGE_ENGINE)
   mysql_add_plugin(
     zset
     ha_zset.cc
+    zset_skiplist.cc
+    zset_hashtable.cc
+    zset_memtable.cc
     STORAGE_ENGINE
     DEFAULT
     LINK_LIBRARIES
@@ -14,6 +17,9 @@ elseif(NOT WITHOUT_ZSET_STORAGE_ENGINE)
   mysql_add_plugin(
     zset
     ha_zset.cc
+    zset_skiplist.cc
+    zset_hashtable.cc
+    zset_memtable.cc
     STORAGE_ENGINE
     MODULE_ONLY
     LINK_LIBRARIES

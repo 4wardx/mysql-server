@@ -15,39 +15,31 @@
 #include "sql/handler.h" /* handler */
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 
-struct ZNode;
+#include "storage/zset/zset_memtable.h"
 
 /** @brief
   Zset_share is a class that will be shared among all open handlers.
-  It owns the per-table LSM state:
-    - Zset_hashtable hashtable: member -> score, whole-table, rebuilt
-      at open for in-memory O(1) lookups.
-    - Zset_lsm lsm: the LevelDB-style store -- skiplist memtable ordered
-      by (score, member), WAL, SSTables, compaction.
+  It owns the per-table state:
+    - ZsetMemTable mem: skiplist ordered by (score, member) plus the
+      member -> ZNode hash table, kept consistent on every mutation.
     - THR_LOCK lock: the MySQL table lock.
-  The members are added together with the core data structures.
 */
 class Zset_share : public Handler_share {
+  friend class ha_zset;
+
  public:
-  THR_LOCK lock;
   Zset_share();
-  ~Zset_share() override { thr_lock_delete(&lock); }
+  ~Zset_share() override { thr_lock_delete(&lock_); }
+
+ private:
+  ZsetMemTable mem_;  ///< Dual-indexed memtable
+  THR_LOCK lock_;
 };
 
 /** @brief
   Class definition for the storage engine
 */
 class ha_zset : public handler {
-  THR_LOCK_DATA lock;     ///< MySQL table lock
-  Zset_share *share;      ///< Shared per-table state (hashtable + LSM)
-  ZNode *scan_pos;        ///< rnd_next / index_next cursor
-  const uchar *last_key;  ///< Current row key for position()
-  uint last_key_len;
-
-  Zset_share *get_share();  ///< Get the share
-  int validate_schema(
-      const TABLE *table) const;  ///< Verify the fixed ZSET table definition
-
  public:
   ha_zset(handlerton *hton, TABLE_SHARE *table_arg);
   ~ha_zset() override = default;
@@ -163,6 +155,23 @@ class ha_zset : public handler {
   int close(void) override;  // required
 
   /** @brief
+    Delete the backing store and WAL file for the table.
+   */
+  int delete_table(const char *from, const dd::Table *table_def) override;
+
+  /** @brief
+    Rename the backing store / WAL file.
+   */
+  int rename_table(const char *from, const char *to,
+                   const dd::Table *from_table_def,
+                   dd::Table *to_table_def) override;
+
+  /** @brief
+    Truncate the table: clear the LSM memtable and truncate the WAL.
+   */
+  int truncate(dd::Table *table_def) override;
+
+  /** @brief
     Insert a row. Encodes the primary key as the LSM internal key, inserts into
     the memtable and appends the WAL.
    */
@@ -178,6 +187,11 @@ class ha_zset : public handler {
     Delete a row. Writes a DELETE tombstone for the internal key in the LSM/WAL.
    */
   int delete_row(const uchar *buf) override;
+
+  /** @brief
+    Remove all rows and truncate the WAL.
+   */
+  int delete_all_rows(void) override;
 
   /** @brief
     Index lookup. Seeks the LSM to the first entry satisfying the key range.
@@ -209,6 +223,10 @@ class ha_zset : public handler {
     Start a sequential scan. Positions the cursor at the first LSM entry.
    */
   int rnd_init(bool scan) override;  // required
+
+  /** @brief
+    End a sequential scan.
+   */
   int rnd_end() override;
 
   /** @brief
@@ -230,6 +248,10 @@ class ha_zset : public handler {
     Fill handler statistics for the optimizer cost model.
    */
   int info(uint) override;  ///< required
+
+  /** @brief
+    Handle extra hints from the server.
+   */
   int extra(enum ha_extra_function operation) override;
 
   /** @brief
@@ -238,34 +260,35 @@ class ha_zset : public handler {
   int external_lock(THD *thd, int lock_type) override;  ///< required
 
   /** @brief
-    Remove all rows and truncate the WAL.
-   */
-  int delete_all_rows(void) override;
-
-  /** @brief
     Estimate rows in a key interval for the optimizer.
    */
   ha_rows records_in_range(uint inx, key_range *min_key,
                            key_range *max_key) override;
 
-  /** @brief
-    Delete the backing store and WAL file for the table.
-   */
-  int delete_table(const char *from, const dd::Table *table_def) override;
-
-  /** @brief
-    Rename the backing store / WAL file.
-   */
-  int rename_table(const char *from, const char *to,
-                   const dd::Table *from_table_def,
-                   dd::Table *to_table_def) override;
-
-  /** @brief
-    Truncate the table: clear the LSM memtable and truncate the WAL.
-   */
-  int truncate(dd::Table *table_def) override;
-
   THR_LOCK_DATA **store_lock(
       THD *thd, THR_LOCK_DATA **to,
       enum thr_lock_type lock_type) override;  ///< required
+
+  Zset_share *get_share();  ///< Get the share
+
+  int validate_schema(
+      const TABLE *table) const;  ///< Verify the fixed ZSET table definition
+
+  // Pack member + score from a node back into the record buffer.
+  void fill_record(uchar *buf, ZNode *node);
+
+  // Extract member bytes from the record buffer.
+  static void decode_member(const TABLE *table, const uchar *buf,
+                            const uchar **m, uint *len);
+
+  // Extract score from the record buffer.
+  static double decode_score(const TABLE *table, const uchar *buf);
+
+  // Decode an index key image into (score, member).
+  static void decode_index_key(const TABLE *table, uint idx, const uchar *key,
+                               double *score, const uchar **m, uint *len);
+
+  THR_LOCK_DATA lock_;  ///< MySQL table lock
+  Zset_share *share_;   ///< Shared per-table state (memtable + lock)
+  ZNode *scan_pos_;     ///< rnd_next / index_next cursor
 };

@@ -1,0 +1,92 @@
+DROP TABLE IF EXISTS t1, t2;
+SELECT ENGINE FROM information_schema.ENGINES WHERE ENGINE='ZSET';
+ENGINE
+ZSET
+CREATE TABLE t1 (
+member VARBINARY(255) NOT NULL,
+score  DOUBLE NOT NULL,
+PRIMARY KEY (member),
+KEY idx_score (score, member)
+) ENGINE=ZSET;
+INSERT INTO t1 VALUES ('apple', 3), ('banana', 1), ('cherry', 1),
+('egg', 1), ('durian', 2.5);
+SELECT member, score FROM t1 ORDER BY score, member;
+member	score
+banana	1
+cherry	1
+egg	1
+durian	2.5
+apple	3
+SELECT score FROM t1 WHERE member = 'apple';
+score
+3
+SELECT member FROM t1 WHERE score BETWEEN 1 AND 1 ORDER BY score, member;
+member
+banana
+cherry
+egg
+SELECT member FROM t1 ORDER BY score DESC LIMIT 1;
+member
+apple
+UPDATE t1 SET score = 0.5 WHERE member = 'apple';
+SELECT score FROM t1 WHERE member = 'apple';
+score
+0.5
+DELETE FROM t1 WHERE score = 1;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+2
+INSERT INTO t1 VALUES ('durian', 9);
+ERROR 23000: Duplicate entry 'durian' for key 't1.PRIMARY'
+CREATE TABLE t2 (a INT) ENGINE=ZSET;
+ERROR HY000: Table storage engine for 't2' doesn't have this option
+TRUNCATE TABLE t1;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+0
+DROP TABLE t1;
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (
+member VARBINARY(255) NOT NULL,
+score  DOUBLE NOT NULL,
+PRIMARY KEY (member),
+KEY idx_score (score, member)
+) ENGINE=ZSET;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+0
+SELECT member FROM t1 ORDER BY score, member;
+member
+DELETE FROM t1 WHERE score = 1;
+DELETE FROM t1 WHERE member = 'x';
+INSERT INTO t1 VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4), ('e', 5);
+SELECT member FROM t1 ORDER BY score DESC;
+member
+e
+d
+c
+b
+a
+DELETE FROM t1 WHERE member = 'b';
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+4
+UPDATE t1 SET member = 'bb', score = 2 WHERE member = 'a';
+SELECT member FROM t1 WHERE score = 2;
+member
+bb
+REPLACE INTO t1 VALUES ('c', 30);
+SELECT score FROM t1 WHERE member = 'c';
+score
+30
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5
+SELECT member FROM t1 ORDER BY member;
+member
+a
+bb
+c
+d
+e
+DROP TABLE t1;

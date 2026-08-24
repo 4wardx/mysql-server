@@ -1,0 +1,102 @@
+#
+# ZSET storage engine test.
+#
+# Covers create/insert/select/update/delete/range/truncate/drop and
+# schema validation. The engine is loaded as a plugin via zset.opt.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+# The ZSET engine must be registered.
+SELECT ENGINE FROM information_schema.ENGINES WHERE ENGINE='ZSET';
+
+# Create the fixed-schema ZSET table.
+CREATE TABLE t1 (
+  member VARBINARY(255) NOT NULL,
+  score  DOUBLE NOT NULL,
+  PRIMARY KEY (member),
+  KEY idx_score (score, member)
+) ENGINE=ZSET;
+
+# Insert rows with duplicate scores.
+INSERT INTO t1 VALUES ('apple', 3), ('banana', 1), ('cherry', 1),
+                      ('egg', 1), ('durian', 2.5);
+
+# Ordered scan along (score, member).
+SELECT member, score FROM t1 ORDER BY score, member;
+
+# PK point lookup (ZSCORE equivalent).
+SELECT score FROM t1 WHERE member = 'apple';
+
+# Score range (ZRANGEBYSCORE equivalent).
+SELECT member FROM t1 WHERE score BETWEEN 1 AND 1 ORDER BY score, member;
+
+# Reverse order (ZREVRANGE equivalent).
+SELECT member FROM t1 ORDER BY score DESC LIMIT 1;
+
+# Update score.
+UPDATE t1 SET score = 0.5 WHERE member = 'apple';
+SELECT score FROM t1 WHERE member = 'apple';
+
+# Delete by score range.
+DELETE FROM t1 WHERE score = 1;
+SELECT COUNT(*) FROM t1;
+
+# Duplicate member must be rejected.
+--error 1062
+INSERT INTO t1 VALUES ('durian', 9);
+
+# Illegal schema must be rejected.
+--error ER_ILLEGAL_HA
+CREATE TABLE t2 (a INT) ENGINE=ZSET;
+
+# Truncate and drop.
+TRUNCATE TABLE t1;
+SELECT COUNT(*) FROM t1;
+DROP TABLE t1;
+
+#
+# Additional edge cases.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+CREATE TABLE t1 (
+  member VARBINARY(255) NOT NULL,
+  score  DOUBLE NOT NULL,
+  PRIMARY KEY (member),
+  KEY idx_score (score, member)
+) ENGINE=ZSET;
+
+# Empty-table operations.
+SELECT COUNT(*) FROM t1;
+SELECT member FROM t1 ORDER BY score, member;
+DELETE FROM t1 WHERE score = 1;
+DELETE FROM t1 WHERE member = 'x';
+
+INSERT INTO t1 VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4), ('e', 5);
+
+# Full reverse ordered scan (index_last / index_prev path).
+SELECT member FROM t1 ORDER BY score DESC;
+
+# Single-row delete by primary key.
+DELETE FROM t1 WHERE member = 'b';
+SELECT COUNT(*) FROM t1;
+
+# Update that changes the primary key (delete old + insert new).
+UPDATE t1 SET member = 'bb', score = 2 WHERE member = 'a';
+SELECT member FROM t1 WHERE score = 2;
+
+# REPLACE uses delete + insert on the primary key.
+REPLACE INTO t1 VALUES ('c', 30);
+SELECT score FROM t1 WHERE member = 'c';
+SELECT COUNT(*) FROM t1;
+
+# Filesort forces position/rnd_pos based reads.
+SELECT member FROM t1 ORDER BY member;
+
+DROP TABLE t1;
