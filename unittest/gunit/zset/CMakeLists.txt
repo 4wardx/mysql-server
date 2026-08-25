@@ -10,6 +10,7 @@ SET(ZSET_UNIT_SOURCES
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_skiplist.cc
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_hashtable.cc
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_memtable.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_wal.cc
 )
 
 MYSQL_ADD_EXECUTABLE(zset-t
@@ -21,4 +22,21 @@ MYSQL_ADD_EXECUTABLE(zset-t
   LINK_LIBRARIES sqlgunitlib gunit_small
   SKIP_INSTALL
   ADD_GCOV_TEST zset
+)
+
+SET(ZSET_BENCH_SOURCES
+  zset-bench.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_skiplist.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_hashtable.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_memtable.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_wal.cc
+)
+
+MYSQL_ADD_EXECUTABLE(zset-bench
+  ${ZSET_BENCH_SOURCES}
+  COMPILE_DEFINITIONS ${DISABLE_PSI_DEFINITIONS}
+  ENABLE_EXPORTS
+  EXCLUDE_FROM_ALL
+  LINK_LIBRARIES sqlgunitlib gunit_small
+  SKIP_INSTALL
 )

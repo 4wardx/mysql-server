@@ -132,7 +132,25 @@ if [ $? -eq 0 ]; then
 	failures=$((failures + 1))
 fi
 
-# 9. Truncate / drop.
+# 9. Crash recovery: kill -9, restart, data must survive (WAL replay).
+kill -9 "$MYSQLD_PID" 2>/dev/null
+wait "$MYSQLD_PID" 2>/dev/null
+sleep 1
+"$BIN/mysqld" --datadir="$DATADIR" --socket="$SOCK" --port="$PORT" \
+	--skip-networking --mysqlx=0 \
+	--plugin-dir="$ROOT/build/plugin_output_directory" \
+	--plugin-load-add=ha_zset.so \
+	>/tmp/zset-test-mysqld.log 2>&1 &
+MYSQLD_PID=$!
+for _ in $(seq 1 60); do
+	"$BIN/mysqladmin" --socket="$SOCK" -uroot ping >/dev/null 2>&1 && break
+	sleep 0.5
+done
+check "crash recovery row count" "4" -e "SELECT COUNT(*) FROM ztest.t;"
+check "crash recovery update persisted" "0.5" \
+	-e "SELECT score FROM ztest.t WHERE member='apple';"
+
+# 10. Truncate / drop.
 sql "TRUNCATE" -e "TRUNCATE TABLE ztest.t;"
 check "after truncate" "0" -e "SELECT COUNT(*) FROM ztest.t;"
 sql "DROP TABLE" -e "DROP TABLE ztest.t;"

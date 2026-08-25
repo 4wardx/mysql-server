@@ -16,6 +16,7 @@
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 
 #include "storage/zset/zset_memtable.h"
+#include "storage/zset/zset_wal.h"
 
 /** @brief
   Zset_share is a class that will be shared among all open handlers.
@@ -32,7 +33,10 @@ class Zset_share : public Handler_share {
   ~Zset_share() override { thr_lock_delete(&lock_); }
 
  private:
-  ZsetMemTable mem_;  ///< Dual-indexed memtable
+  ZsetMemTable mem_;       ///< Versioned memtable
+  Zset_wal wal_;           ///< Write-ahead log
+  uint64 seq_ = 0;         ///< Sequence counter for internal keys
+  bool replayed_ = false;  ///< True once the WAL has been replayed
   THR_LOCK lock_;
 };
 

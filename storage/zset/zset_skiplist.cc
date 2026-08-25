@@ -24,7 +24,7 @@ void ZNode::setNextRelaxed(int n, ZNode *x) const {
 }
 
 ZsetSkiplist::ZsetSkiplist()
-    : head_(createNode(0, nullptr, 0, kMaxHeight)),
+    : head_(createNode(0, nullptr, 0, 0, ZsetType::kPut, kMaxHeight)),
       top_level_(1),
       rng_(std::random_device{}()),
       count_(0) {
@@ -40,12 +40,10 @@ ZsetSkiplist::~ZsetSkiplist() {
   free(head_);
 }
 
-ZNode *ZsetSkiplist::insert(double score, const uchar *member, uint len) {
-  // Predecessor node at each level, for rewiring next pointers.
+ZNode *ZsetSkiplist::insert(double score, const uchar *member, uint len,
+                            uint64 seq, ZsetType type) {
   ZNode *pred[kMaxHeight];
-  ZNode *x = findLowerBound(score, member, len, pred);
-  assert(x == nullptr ||
-         !keysEqual(score, member, len, x->score, x->member, x->member_len));
+  ZNode *x = findLowerBound(score, member, len, seq, type, pred);
 
   int level = randomLevel();
   if (level > currentHeight()) {
@@ -55,7 +53,7 @@ ZNode *ZsetSkiplist::insert(double score, const uchar *member, uint len) {
     top_level_.store(level, std::memory_order_relaxed);
   }
 
-  ZNode *node = createNode(score, member, len, level);
+  ZNode *node = createNode(score, member, len, seq, type, level);
   for (int i = 0; i < level; i++) {
     node->setNextRelaxed(i, pred[i]->nextRelaxed(i));
     pred[i]->setNext(i, node);
@@ -69,34 +67,6 @@ ZNode *ZsetSkiplist::insert(double score, const uchar *member, uint len) {
   count_++;
 
   return node;
-}
-
-void ZsetSkiplist::remove(const uchar *member, uint len, double score) {
-  ZNode *pred[kMaxHeight];
-  ZNode *x = findLowerBound(score, member, len, pred);
-  if (x == nullptr ||
-      !keysEqual(score, member, len, x->score, x->member, x->member_len)) {
-    return;
-  }
-
-  for (int i = 0; i < currentHeight(); i++) {
-    if (pred[i]->next(i) != x) {
-      break;
-    }
-    pred[i]->setNext(i, x->next(i));
-  }
-
-  if (x->next(0) != nullptr) {
-    x->next(0)->backward = x->backward;
-  }
-
-  free(x->member);
-  free(x);
-
-  while (currentHeight() > 1 && head_->next(currentHeight() - 1) == nullptr) {
-    top_level_.store(currentHeight() - 1, std::memory_order_relaxed);
-  }
-  count_--;
 }
 
 void ZsetSkiplist::clear() {
@@ -124,7 +94,6 @@ ZNode *ZsetSkiplist::last() const {
       x = x->next(i);
     }
   }
-
   return x == head_ ? nullptr : x;
 }
 
@@ -170,7 +139,9 @@ void ZsetSkiplist::Cursor::prev() {
 }
 
 void ZsetSkiplist::Cursor::seekTo(double score, const uchar *member, uint len) {
-  node_ = list_->findLowerBound(score, member, len, nullptr);
+  // Seek to the newest version of the first (score, member) >= target.
+  node_ =
+      list_->findLowerBound(score, member, len, ~0ULL, ZsetType::kPut, nullptr);
 }
 
 void ZsetSkiplist::Cursor::seekToFirst() { node_ = list_->first(); }
@@ -184,12 +155,13 @@ int ZsetSkiplist::randomLevel() {
   while (level < kMaxHeight && dist(rng_) == 0) {
     level++;
   }
-
   return level;
 }
 
 int ZsetSkiplist::compare(double score_a, const uchar *member_a, uint len_a,
-                          double score_b, const uchar *member_b, uint len_b) {
+                          uint64 seq_a, ZsetType type_a, double score_b,
+                          const uchar *member_b, uint len_b, uint64 seq_b,
+                          ZsetType type_b) {
   if (score_a < score_b) {
     return -1;
   }
@@ -210,22 +182,31 @@ int ZsetSkiplist::compare(double score_a, const uchar *member_a, uint len_a,
     return 1;
   }
 
-  return 0;
+  // Same (score, member): newer sequence first.
+  if (seq_a > seq_b) {
+    return -1;
+  }
+  if (seq_a < seq_b) {
+    return 1;
+  }
+
+  return static_cast<int>(type_a) < static_cast<int>(type_b) ? -1 : 1;
 }
 
 ZNode *ZsetSkiplist::createNode(double score, const uchar *member, uint len,
-                                int level) {
-  // Flexible array: one slot is embedded, allocate level-1 more.
-  size_t bytes = sizeof(ZNode) + (sizeof(std::atomic<ZNode *>) * (level - 1));
+                                uint64 seq, ZsetType type, int level) {
+  size_t bytes = sizeof(ZNode) + sizeof(std::atomic<ZNode *>) * (level - 1);
   ZNode *node = (ZNode *)malloc(bytes);
   node->score = score;
   node->member = nullptr;
   node->member_len = len;
+  node->seq = seq;
+  node->type = type;
   node->level = level;
   node->backward = nullptr;
 
   if (len > 0) {
-    node->member = static_cast<uchar *>(malloc(len));
+    node->member = (uchar *)malloc(len);
     memcpy(node->member, member, len);
   }
 
@@ -239,20 +220,22 @@ ZNode *ZsetSkiplist::createNode(double score, const uchar *member, uint len,
 bool ZsetSkiplist::keysEqual(double score_a, const uchar *member_a, uint len_a,
                              double score_b, const uchar *member_b,
                              uint len_b) {
-  return compare(score_a, member_a, len_a, score_b, member_b, len_b) == 0;
+  return score_a == score_b && len_a == len_b &&
+         (len_a == 0 || memcmp(member_a, member_b, len_a) == 0);
 }
 
 bool ZsetSkiplist::keyGreaterThan(double score, const uchar *member, uint len,
-                                  ZNode *n) {
-  return n != nullptr &&
-         compare(n->score, n->member, n->member_len, score, member, len) < 0;
+                                  uint64 seq, ZsetType type, ZNode *n) {
+  return n != nullptr && compare(n->score, n->member, n->member_len, n->seq,
+                                 n->type, score, member, len, seq, type) < 0;
 }
 
 ZNode *ZsetSkiplist::findLowerBound(double score, const uchar *member, uint len,
+                                    uint64 seq, ZsetType type,
                                     ZNode **pred) const {
   ZNode *x = head_;
   for (int i = currentHeight() - 1; i >= 0; i--) {
-    while (keyGreaterThan(score, member, len, x->next(i))) {
+    while (keyGreaterThan(score, member, len, seq, type, x->next(i))) {
       x = x->next(i);
     }
     if (pred != nullptr) {
@@ -269,7 +252,8 @@ ZNode *ZsetSkiplist::findPredecessor(double score, const uchar *member,
   for (int i = currentHeight() - 1; i >= 0; i--) {
     while (x->next(i) != nullptr &&
            compare(x->next(i)->score, x->next(i)->member,
-                   x->next(i)->member_len, score, member, len) < 0) {
+                   x->next(i)->member_len, x->next(i)->seq, x->next(i)->type,
+                   score, member, len, x->next(i)->seq, x->next(i)->type) < 0) {
       x = x->next(i);
     }
   }

@@ -81,10 +81,9 @@ score
 30
 SELECT COUNT(*) FROM t1;
 COUNT(*)
-5
+4
 SELECT member FROM t1 ORDER BY member;
 member
-a
 bb
 c
 d
