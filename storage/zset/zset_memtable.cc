@@ -35,13 +35,14 @@ void ZsetMemTable::clear() {
   skiplist_.clear();
 }
 
-ZNode *ZsetMemTable::firstLive() const {
+ZNode *ZsetMemTable::firstLive(uint64 max_seq) const {
   ZNode *n = skiplist_.first();
   while (n != nullptr) {
-    if (n->type == ZsetType::kPut) {
-      return n;
+    ZNode *active = activeVersion(n, max_seq);
+    if (active != nullptr && active->type == ZsetType::kPut) {
+      return active;
     }
-    // Tombstoned: skip every older version of this user key.
+    // Tombstoned or entirely newer than max_seq: skip the whole group.
     ZNode *run = n;
     n = skiplist_.next(n);
     while (n != nullptr && sameUserKey(n, run)) {
@@ -51,7 +52,7 @@ ZNode *ZsetMemTable::firstLive() const {
   return nullptr;
 }
 
-ZNode *ZsetMemTable::nextLive(const ZNode *cur) const {
+ZNode *ZsetMemTable::nextLive(const ZNode *cur, uint64 max_seq) const {
   ZNode *n = cur == nullptr ? skiplist_.first() : skiplist_.next(cur);
   while (n != nullptr) {
     // Skip shadowed older versions of the current user key.
@@ -60,10 +61,11 @@ ZNode *ZsetMemTable::nextLive(const ZNode *cur) const {
       continue;
     }
     // n is the newest internal key of its user key.
-    if (n->type == ZsetType::kPut) {
-      return n;
+    ZNode *active = activeVersion(n, max_seq);
+    if (active != nullptr && active->type == ZsetType::kPut) {
+      return active;
     }
-    // Tombstoned: skip every older version of this user key.
+    // Tombstoned or entirely newer than max_seq: skip the whole group.
     ZNode *run = n;
     n = skiplist_.next(n);
     while (n != nullptr && sameUserKey(n, run)) {
@@ -73,42 +75,53 @@ ZNode *ZsetMemTable::nextLive(const ZNode *cur) const {
   return nullptr;
 }
 
-ZNode *ZsetMemTable::lastLive() const {
+ZNode *ZsetMemTable::lastLive(uint64 max_seq) const {
   ZNode *n = skiplist_.last();
   while (n != nullptr) {
     ZNode *newest = newestVersion(n);
-    if (newest->type == ZsetType::kPut) {
-      return newest;
+    ZNode *active = activeVersion(newest, max_seq);
+    if (active != nullptr && active->type == ZsetType::kPut) {
+      return active;
     }
     n = skiplist_.prev(newest);
   }
   return nullptr;
 }
 
-ZNode *ZsetMemTable::prevLive(const ZNode *cur) const {
+ZNode *ZsetMemTable::prevLive(const ZNode *cur, uint64 max_seq) const {
   ZNode *n = cur == nullptr ? skiplist_.last() : skiplist_.prev(cur);
   while (n != nullptr) {
+    // n may be a newer-than-max_seq version of cur's own user key (the
+    // group front sits before cur in the chain); skip to the previous
+    // user key.
+    if (cur != nullptr && sameUserKey(n, cur)) {
+      ZNode *front = newestVersion(n);
+      n = skiplist_.prev(front);
+      continue;
+    }
     ZNode *newest = newestVersion(n);
-    if (newest->type == ZsetType::kPut) {
-      return newest;
+    ZNode *active = activeVersion(newest, max_seq);
+    if (active != nullptr && active->type == ZsetType::kPut) {
+      return active;
     }
     n = skiplist_.prev(newest);
   }
   return nullptr;
 }
 
-ZNode *ZsetMemTable::seekLive(double score, const uchar *member,
-                              uint len) const {
+ZNode *ZsetMemTable::seekLive(double score, const uchar *member, uint len,
+                              uint64 max_seq) const {
   ZsetSkiplist::Cursor cur(&skiplist_);
   // Seek to the first internal key >= (score, member) at max seq, then
   // advance to the first live node.
   cur.seekTo(score, member, len);
   ZNode *n = cur.valid() ? cur.current() : nullptr;
   while (n != nullptr) {
-    if (n->type == ZsetType::kPut) {
-      return n;
+    ZNode *active = activeVersion(n, max_seq);
+    if (active != nullptr && active->type == ZsetType::kPut) {
+      return active;
     }
-    // Tombstoned: skip every older version of this user key.
+    // Tombstoned or entirely newer than max_seq: skip the whole group.
     ZNode *run = n;
     n = skiplist_.next(n);
     while (n != nullptr && sameUserKey(n, run)) {
@@ -142,4 +155,15 @@ ZNode *ZsetMemTable::newestVersion(ZNode *n) const {
     p = skiplist_.prev(newest);
   }
   return newest;
+}
+
+ZNode *ZsetMemTable::activeVersion(ZNode *n, uint64 max_seq) const {
+  ZNode *active = n;
+  while (active != nullptr && active->seq > max_seq) {
+    active = skiplist_.next(active);
+    if (active != nullptr && !sameUserKey(active, n)) {
+      return nullptr;  // every version is newer than max_seq
+    }
+  }
+  return active;
 }

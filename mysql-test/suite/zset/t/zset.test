@@ -96,7 +96,132 @@ REPLACE INTO t1 VALUES ('c', 30);
 SELECT score FROM t1 WHERE member = 'c';
 SELECT COUNT(*) FROM t1;
 
+# Non-idempotent full-table update: score=score+10 must apply exactly
+# once. Before snapshot scans, the new versions re-sorted after the scan
+# cursor and the UPDATE re-applied forever.
+UPDATE t1 SET score = score + 10;
+SELECT member, score FROM t1 ORDER BY score, member;
+
 # Filesort forces position/rnd_pos based reads.
 SELECT member FROM t1 ORDER BY member;
 
 DROP TABLE t1;
+
+#
+# Snapshot scans, index-path updates and score ordering edge cases.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+CREATE TABLE t1 (
+  member VARBINARY(255) NOT NULL,
+  score  DOUBLE NOT NULL,
+  PRIMARY KEY (member),
+  KEY idx_score (score, member)
+) ENGINE=ZSET;
+
+# Negative and fractional scores sort correctly.
+INSERT INTO t1 VALUES ('a', -5), ('b', 0), ('c', 2.5), ('d', -0.5), ('e', 10);
+SELECT member, score FROM t1 ORDER BY score, member;
+
+# Index-path range update: score=score+10 applies exactly once to the rows
+# in the range (the snapshot fix covers index scans too).
+UPDATE t1 SET score = score + 10 WHERE score BETWEEN -1 AND 3;
+SELECT member, score FROM t1 ORDER BY score, member;
+
+# Index-path range delete.
+DELETE FROM t1 WHERE score >= 15;
+SELECT COUNT(*) FROM t1;
+
+# Two full-table updates in separate statements stack correctly (each
+# statement gets a fresh scan snapshot).
+UPDATE t1 SET score = score + 1;
+UPDATE t1 SET score = score + 1;
+SELECT member, score FROM t1 ORDER BY score, member;
+
+# Update that reorders rows: raise a low member past the highest one.
+UPDATE t1 SET score = 100 WHERE member = 'a';
+SELECT member, score FROM t1 ORDER BY score, member;
+
+# Reverse order via idx_score.
+SELECT member, score FROM t1 ORDER BY score DESC;
+
+# Filesort on member with tied scores.
+INSERT INTO t1 VALUES ('x', 5), ('y', 5), ('z', 5);
+SELECT member, score FROM t1 ORDER BY member;
+
+# REPLACE changes the key and the score together.
+REPLACE INTO t1 VALUES ('b', 50);
+SELECT member, score FROM t1 WHERE member = 'b';
+
+# Boundary checks on the score range.
+SELECT COUNT(*) FROM t1 WHERE score <= 5;
+SELECT COUNT(*) FROM t1 WHERE score > 5;
+
+# One statement changes both the primary key and the score.
+UPDATE t1 SET member = 'b2', score = score + 1 WHERE member = 'b';
+SELECT member, score FROM t1 WHERE member IN ('b', 'b2');
+
+# LIMIT over an ordered range.
+SELECT member FROM t1 ORDER BY score, member LIMIT 2;
+
+DROP TABLE t1;
+
+#
+# Complex SQL: aggregates, GROUP BY / HAVING, joins, subqueries.
+# These read through the handler, so they exercise rnd/index scans,
+# position/rnd_pos re-reads and temp-table interaction.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+CREATE TABLE t1 (
+  member VARBINARY(255) NOT NULL,
+  score  DOUBLE NOT NULL,
+  PRIMARY KEY (member),
+  KEY idx_score (score, member)
+) ENGINE=ZSET;
+
+CREATE TABLE t2 (
+  member VARBINARY(255) NOT NULL,
+  score  DOUBLE NOT NULL,
+  PRIMARY KEY (member),
+  KEY idx_score (score, member)
+) ENGINE=ZSET;
+
+INSERT INTO t1 VALUES ('a', 1), ('b', 2), ('c', 1), ('d', 3), ('e', 2), ('f', 1);
+INSERT INTO t2 VALUES ('a', 10), ('b', 20), ('z', 99);
+
+# Aggregates grouped by score.
+SELECT score, COUNT(*), SUM(score), AVG(score), MIN(score), MAX(score)
+FROM t1 GROUP BY score ORDER BY score;
+
+# HAVING filters the groups.
+SELECT score, COUNT(*) FROM t1 GROUP BY score HAVING COUNT(*) >= 2 ORDER BY score;
+
+# Inner join on the primary key.
+SELECT t1.member, t1.score, t2.score FROM t1 JOIN t2 ON t1.member = t2.member
+ORDER BY t1.member;
+
+# Left join leaves the unmatched rows NULL.
+SELECT t1.member, t2.score FROM t1 LEFT JOIN t2 ON t1.member = t2.member
+ORDER BY t1.member;
+
+# IN subquery.
+SELECT member FROM t1 WHERE member IN (SELECT member FROM t2) ORDER BY member;
+
+# EXISTS subquery.
+SELECT member FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.member = t1.member)
+ORDER BY member;
+
+# DISTINCT over the score column.
+SELECT DISTINCT score FROM t1 ORDER BY score;
+
+# UNION of both tables.
+SELECT member FROM t1 UNION SELECT member FROM t2 ORDER BY member;
+
+DROP TABLE t1, t2;

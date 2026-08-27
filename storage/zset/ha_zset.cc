@@ -321,7 +321,7 @@ int ha_zset::index_read_map(uchar *buf, const uchar *key,
     }
 
     fill_record(buf, node);
-    scan_pos_ = share_->mem_.nextLive(node);
+    scan_pos_ = share_->mem_.nextLive(node, scan_seq_);
 
     return 0;
   }
@@ -335,7 +335,7 @@ int ha_zset::index_read_map(uchar *buf, const uchar *key,
     m = key + 8 + 2;
   }
 
-  scan_pos_ = share_->mem_.seekLive(score, m, len);
+  scan_pos_ = share_->mem_.seekLive(score, m, len, scan_seq_);
   if (scan_pos_ == nullptr) {
     return HA_ERR_KEY_NOT_FOUND;
   }
@@ -357,7 +357,7 @@ int ha_zset::index_read_map(uchar *buf, const uchar *key,
   }
 
   fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_);
+  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
 
   return 0;
 }
@@ -369,7 +369,7 @@ int ha_zset::index_next(uchar *buf) {
   }
 
   fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_);
+  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
 
   return 0;
 }
@@ -381,31 +381,31 @@ int ha_zset::index_prev(uchar *buf) {
   }
 
   fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.prevLive(scan_pos_);
+  scan_pos_ = share_->mem_.prevLive(scan_pos_, scan_seq_);
 
   return 0;
 }
 
 int ha_zset::index_first(uchar *buf) {
   DBUG_TRACE;
-  scan_pos_ = share_->mem_.firstLive();
+  scan_pos_ = share_->mem_.firstLive(scan_seq_);
   if (scan_pos_ == nullptr) {
     return HA_ERR_END_OF_FILE;
   }
   fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_);
+  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
 
   return 0;
 }
 
 int ha_zset::index_last(uchar *buf) {
   DBUG_TRACE;
-  scan_pos_ = share_->mem_.lastLive();
+  scan_pos_ = share_->mem_.lastLive(scan_seq_);
   if (scan_pos_ == nullptr) {
     return HA_ERR_END_OF_FILE;
   }
   fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.prevLive(scan_pos_);
+  scan_pos_ = share_->mem_.prevLive(scan_pos_, scan_seq_);
 
   return 0;
 }
@@ -416,7 +416,16 @@ int ha_zset::index_last(uchar *buf) {
 
 int ha_zset::rnd_init(bool) {
   DBUG_TRACE;
-  scan_pos_ = share_->mem_.firstLive();
+  scan_seq_ = share_->seq_;
+  scan_pos_ = share_->mem_.firstLive(scan_seq_);
+  return 0;
+}
+
+int ha_zset::index_init(uint idx, bool) {
+  DBUG_TRACE;
+  active_index = idx;
+  scan_seq_ = share_->seq_;
+  scan_pos_ = nullptr;
   return 0;
 }
 
@@ -432,7 +441,7 @@ int ha_zset::rnd_next(uchar *buf) {
   }
 
   fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_);
+  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
 
   return 0;
 }

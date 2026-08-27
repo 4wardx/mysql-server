@@ -229,6 +229,12 @@ class ha_zset : public handler {
   int rnd_init(bool scan) override;  // required
 
   /** @brief
+    Start an index scan; snapshots the sequence number so the scan is a
+    stable view even when rows are updated while it runs.
+   */
+  int index_init(uint idx, bool sorted) override;
+
+  /** @brief
     End a sequential scan.
    */
   int rnd_end() override;
@@ -295,4 +301,5 @@ class ha_zset : public handler {
   THR_LOCK_DATA lock_;  ///< MySQL table lock
   Zset_share *share_;   ///< Shared per-table state (memtable + lock)
   ZNode *scan_pos_;     ///< rnd_next / index_next cursor
+  uint64 scan_seq_;     ///< Scan snapshot watermark (~0ULL = no filtering)
 };

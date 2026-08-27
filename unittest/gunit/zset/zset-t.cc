@@ -359,6 +359,243 @@ TEST(ZsetMemTableTest, CountConsistency) {
   EXPECT_EQ(mem.count(), 5000U - deleted);
 }
 
+// Snapshot scan: live iterators with a max_seq watermark ignore versions
+// written after the scan started, so rows updated mid-scan are not
+// re-visited (the fix for the UPDATE re-scan loop).
+TEST(ZsetMemTableTest, SnapshotScan) {
+  ZsetMemTable mem;
+
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  mem.put(1.0, m, len, 1);
+  m = member("b", &len);
+  mem.put(2.0, m, len, 2);
+  m = member("c", &len);
+  mem.put(3.0, m, len, 3);
+
+  const uint64 watermark = 3;  // snapshot taken right after the inserts
+
+  // Score changes during the "scan": tombstone the old key, put the new.
+  m = member("a", &len);
+  mem.tombstone(1.0, m, len, 4);
+  mem.put(11.0, m, len, 5);
+  m = member("c", &len);
+  mem.tombstone(3.0, m, len, 6);
+  mem.put(13.0, m, len, 7);
+
+  // Full view sees the new values.
+  double score;
+  m = member("a", &len);
+  ASSERT_TRUE(mem.get(m, len, &score));
+  EXPECT_EQ(score, 11.0);
+  EXPECT_EQ(mem.count(), 3U);
+
+  // Snapshot view as of the watermark still returns each row once, with
+  // its original value.
+  vector<double> scores;
+  for (ZNode *n = mem.firstLive(watermark); n != nullptr;
+       n = mem.nextLive(n, watermark)) {
+    scores.push_back(n->score);
+  }
+  const vector<double> expected = {1.0, 2.0, 3.0};
+  EXPECT_EQ(scores, expected);
+}
+
+// The exact UPDATE re-scan scenario: every row is moved to a higher
+// score several times while the scan runs. The snapshot view still
+// visits each original row exactly once and terminates.
+TEST(ZsetMemTableTest, SnapshotUpdateLoop) {
+  ZsetMemTable mem;
+
+  uint len;
+  const uchar *m;
+  const char *names[] = {"a", "b", "c", "d", "e"};
+  uint64 seq = 0;
+  for (const char *name : names) {
+    m = member(name, &len);
+    seq++;
+    mem.put(static_cast<double>(seq), m, len, seq);  // a=1..e=5
+  }
+  const uint64 watermark = 5;
+
+  // Three rounds of score=score+10 over all rows.
+  for (int round = 0; round < 3; round++) {
+    for (const char *name : names) {
+      m = member(name, &len);
+      double old_score;
+      ASSERT_TRUE(mem.get(m, len, &old_score));
+      mem.tombstone(old_score, m, len, ++seq);
+      mem.put(old_score + 10.0, m, len, ++seq);
+    }
+  }
+
+  int rows = 0;
+  vector<double> scores;
+  for (ZNode *n = mem.firstLive(watermark); n != nullptr;
+       n = mem.nextLive(n, watermark)) {
+    rows++;
+    scores.push_back(n->score);
+  }
+  EXPECT_EQ(rows, 5);
+  const vector<double> expected = {1.0, 2.0, 3.0, 4.0, 5.0};
+  EXPECT_EQ(scores, expected);
+
+  // The full view, in contrast, has moved on.
+  double score;
+  m = member("a", &len);
+  ASSERT_TRUE(mem.get(m, len, &score));
+  EXPECT_EQ(score, 31.0);
+}
+
+// A delete during the scan: the tombstone is newer than the watermark, so
+// the snapshot view still shows the row; the full view does not.
+TEST(ZsetMemTableTest, SnapshotDeleteMidScan) {
+  ZsetMemTable mem;
+
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  mem.put(1.0, m, len, 1);
+  m = member("b", &len);
+  mem.put(2.0, m, len, 2);
+
+  const uint64 watermark = 2;
+  m = member("a", &len);
+  mem.tombstone(1.0, m, len, 3);  // delete a during the scan
+
+  double score;
+  EXPECT_FALSE(mem.get(m, len, &score));  // gone from the full view
+  EXPECT_EQ(mem.count(), 1U);
+
+  vector<double> scores;
+  for (ZNode *n = mem.firstLive(watermark); n != nullptr;
+       n = mem.nextLive(n, watermark)) {
+    scores.push_back(n->score);
+  }
+  const vector<double> expected = {1.0, 2.0};  // still visible in the snapshot
+  EXPECT_EQ(scores, expected);
+}
+
+// A brand-new member inserted during the scan is invisible to the
+// snapshot (it did not exist when the scan started).
+TEST(ZsetMemTableTest, SnapshotNewKeyMidScan) {
+  ZsetMemTable mem;
+
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  mem.put(1.0, m, len, 1);
+
+  const uint64 watermark = 1;
+  m = member("b", &len);
+  mem.put(2.0, m, len, 2);  // new key during the scan
+
+  vector<double> scores;
+  for (ZNode *n = mem.firstLive(watermark); n != nullptr;
+       n = mem.nextLive(n, watermark)) {
+    scores.push_back(n->score);
+  }
+  const vector<double> expected = {1.0};
+  EXPECT_EQ(scores, expected);
+
+  double score;
+  m = member("b", &len);
+  ASSERT_TRUE(mem.get(m, len, &score));  // but it is in the full view
+  EXPECT_EQ(score, 2.0);
+}
+
+// The watermark applies to reverse scans and seekLive as well.
+TEST(ZsetMemTableTest, SnapshotReverseAndSeek) {
+  ZsetMemTable mem;
+
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  mem.put(1.0, m, len, 1);
+  m = member("b", &len);
+  mem.put(2.0, m, len, 2);
+  m = member("c", &len);
+  mem.put(3.0, m, len, 3);
+
+  const uint64 watermark = 3;
+  m = member("c", &len);
+  mem.tombstone(3.0, m, len, 4);
+  mem.put(13.0, m, len, 5);  // update c during the "scan"
+
+  vector<double> scores;
+  for (ZNode *n = mem.lastLive(watermark); n != nullptr;
+       n = mem.prevLive(n, watermark)) {
+    scores.push_back(n->score);
+  }
+  const vector<double> expected = {3.0, 2.0, 1.0};
+  EXPECT_EQ(scores, expected);
+
+  m = member("b", &len);
+  ZNode *node = mem.seekLive(2.0, m, len, watermark);
+  ASSERT_NE(node, nullptr);
+  EXPECT_EQ(node->score, 2.0);
+
+  // A key that only exists above the watermark is not found.
+  m = member("c", &len);
+  node = mem.seekLive(13.0, m, len, watermark);
+  EXPECT_EQ(node, nullptr);
+}
+
+// Default iterators (max_seq = ~0ULL) see the full live view: the newest
+// version wins.
+TEST(ZsetMemTableTest, SnapshotNoFilter) {
+  ZsetMemTable mem;
+
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  mem.put(1.0, m, len, 1);
+  m = member("a", &len);
+  mem.tombstone(1.0, m, len, 2);  // update a: 1 -> 11
+  mem.put(11.0, m, len, 3);
+
+  double score;
+  m = member("a", &len);
+  ASSERT_TRUE(mem.get(m, len, &score));
+  EXPECT_EQ(score, 11.0);
+
+  vector<double> scores;
+  for (ZNode *n = mem.firstLive(); n != nullptr; n = mem.nextLive(n)) {
+    scores.push_back(n->score);
+  }
+  const vector<double> expected = {11.0};
+  EXPECT_EQ(scores, expected);
+}
+
+// A row deleted before the scan started stays absent from the snapshot
+// (the watermark does not resurrect pre-scan tombstones), but a re-added
+// version is present.
+TEST(ZsetMemTableTest, SnapshotPreScanDelete) {
+  ZsetMemTable mem;
+
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  mem.put(1.0, m, len, 1);
+  m = member("b", &len);
+  mem.put(2.0, m, len, 2);
+  m = member("a", &len);
+  mem.tombstone(1.0, m, len, 3);  // delete a
+  m = member("a", &len);
+  mem.put(5.0, m, len, 4);  // and re-add it
+
+  const uint64 watermark = 4;  // scan starts now: a=5, b=2
+
+  vector<double> scores;
+  for (ZNode *n = mem.firstLive(watermark); n != nullptr;
+       n = mem.nextLive(n, watermark)) {
+    scores.push_back(n->score);
+  }
+  const vector<double> expected = {2.0, 5.0};
+  EXPECT_EQ(scores, expected);
+}
+
 // WAL: append PUT/DELETE with seq, replay restores the live view + seq.
 TEST(ZsetWalTest, AppendReplay) {
   unlink(kWalTestPath);

@@ -64,20 +64,23 @@ class ZsetMemTable {
   // Drop all versions and tombstones.
   void clear();
 
-  // First live node in key order, or nullptr.
-  ZNode *firstLive() const;
+  // First live node in key order, or nullptr. With max_seq set, the scan
+  // is a snapshot as of that sequence: versions newer than max_seq are
+  // invisible, so rows updated while a scan runs are not re-visited.
+  ZNode *firstLive(uint64 max_seq = ~0ULL) const;
 
   // Next live node after cur in key order, or nullptr.
-  ZNode *nextLive(const ZNode *cur) const;
+  ZNode *nextLive(const ZNode *cur, uint64 max_seq = ~0ULL) const;
 
   // Last live node in key order, or nullptr.
-  ZNode *lastLive() const;
+  ZNode *lastLive(uint64 max_seq = ~0ULL) const;
 
   // Previous live node before cur in key order, or nullptr.
-  ZNode *prevLive(const ZNode *cur) const;
+  ZNode *prevLive(const ZNode *cur, uint64 max_seq = ~0ULL) const;
 
   // First live node whose key is at or after the target, or nullptr.
-  ZNode *seekLive(double score, const uchar *member, uint len) const;
+  ZNode *seekLive(double score, const uchar *member, uint len,
+                  uint64 max_seq = ~0ULL) const;
 
   // Live rows whose score falls in the range, for the optimizer.
   size_t countLiveInRange(double min, double max) const;
@@ -98,6 +101,10 @@ class ZsetMemTable {
   // among all versions of the same (score, member). Returns n itself
   // when the versioned walk lands on an older version first.
   ZNode *newestVersion(ZNode *n) const;
+
+  // Newest internal key of the group containing n whose seq is not newer
+  // than max_seq, or nullptr if every version is newer than max_seq.
+  ZNode *activeVersion(ZNode *n, uint64 max_seq) const;
 
   ZsetSkiplist skiplist_;    // All versions and tombstones
   ZsetHashtable hashtable_;  // Live view: member -> newest PUT node
