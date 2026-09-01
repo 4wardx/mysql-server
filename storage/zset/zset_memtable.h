@@ -47,10 +47,10 @@ class ZsetMemTable {
   ZsetMemTable &operator=(const ZsetMemTable &) = delete;
 
   // Record a PUT for the member and return its node.
-  ZNode *put(double score, const uchar *member, uint len, uint64 seq);
+  ZNode *put(double score, const uchar *member, uint len, uint64 sequence);
 
   // Record a delete tombstone for the member.
-  void tombstone(double score, const uchar *member, uint len, uint64 seq);
+  void tombstone(double score, const uchar *member, uint len, uint64 sequence);
 
   // Live score for the member, or false if absent or deleted.
   bool get(const uchar *member, uint len, double *score) const;

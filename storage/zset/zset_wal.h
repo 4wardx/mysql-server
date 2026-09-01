@@ -40,8 +40,11 @@ class Zset_wal {
   // Close the log.
   int close();
 
+  // Truncate the log back to empty (used after a flush).
+  int reset();
+
   // Append one mutation record with its sequence number. Returns 0.
-  int append(double score, const uchar *member, uint len, uint64 seq,
+  int append(double score, const uchar *member, uint len, uint64 sequence,
              Type type);
 
   // Append a CLEAR record that voids all prior records.
@@ -56,7 +59,8 @@ class Zset_wal {
   bool is_open() const { return fd_ >= 0; }
 
  private:
-  File fd_ = -1;
+  File fd_ = -1;      // Open log file, or -1 when closed
+  std::string path_;  // Log path, for reset()
 };
 
 #endif  // ZSET_WAL_H

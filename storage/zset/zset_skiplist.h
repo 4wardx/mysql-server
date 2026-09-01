@@ -16,7 +16,7 @@ struct ZNode {
   double score;     // Sort key
   uchar *member;    // Member bytes, owned by this node
   uint member_len;  // Member length
-  uint64 seq;       // Sequence number, newer first
+  uint64 sequence;  // Sequence number, newer first
   ZsetType type;    // PUT or DELETE
   int level;        // Node height
   ZNode *backward;  // Predecessor at level 0
@@ -37,6 +37,14 @@ struct ZNode {
   mutable std::atomic<ZNode *> next_[1];  // Level pointers
 };
 
+// Compare internal keys: score, member, then seq descending, then type.
+// The single ordering used by the memtable, the merged LSM view and
+// (via the sstable byte encoding) the on-disk files.
+int zset_compare_keys(double score_a, const uchar *member_a, uint len_a,
+                      uint64 seq_a, ZsetType type_a, double score_b,
+                      const uchar *member_b, uint len_b, uint64 seq_b,
+                      ZsetType type_b);
+
 // Skiplist for the ZSET memtable: an ordered store of internal keys.
 // All versions and tombstones are kept; only clear() drops everything,
 // while compaction reclaims shadowed entries.
@@ -49,7 +57,7 @@ class ZsetSkiplist {
   ZsetSkiplist &operator=(const ZsetSkiplist &) = delete;
 
   // Insert an internal key node and return it.
-  ZNode *insert(double score, const uchar *member, uint len, uint64 seq,
+  ZNode *insert(double score, const uchar *member, uint len, uint64 sequence,
                 ZsetType type);
 
   // Drop all nodes and reset to empty.
@@ -110,15 +118,9 @@ class ZsetSkiplist {
   // Random level, about 25% chance to grow.
   int randomLevel();
 
-  // Compare internal keys: score, member, then seq descending, then type.
-  static int compare(double score_a, const uchar *member_a, uint len_a,
-                     uint64 seq_a, ZsetType type_a, double score_b,
-                     const uchar *member_b, uint len_b, uint64 seq_b,
-                     ZsetType type_b);
-
   // Allocate and init a node.
   static ZNode *createNode(double score, const uchar *member, uint len,
-                           uint64 seq, ZsetType type, int level);
+                           uint64 sequence, ZsetType type, int level);
 
   // True if the keys have the same user key (score, member).
   static bool keysEqual(double score_a, const uchar *member_a, uint len_a,
@@ -126,11 +128,11 @@ class ZsetSkiplist {
 
   // True if the key is strictly greater than the given node's key.
   static bool keyGreaterThan(double score, const uchar *member, uint len,
-                             uint64 seq, ZsetType type, ZNode *n);
+                             uint64 sequence, ZsetType type, ZNode *n);
 
   // First node with key >= target, filling predecessors per level.
-  ZNode *findLowerBound(double score, const uchar *member, uint len, uint64 seq,
-                        ZsetType type, ZNode **pred) const;
+  ZNode *findLowerBound(double score, const uchar *member, uint len,
+                        uint64 sequence, ZsetType type, ZNode **pred) const;
 
   // Last node whose user key is strictly before the target.
   ZNode *findPredecessor(double score, const uchar *member, uint len) const;

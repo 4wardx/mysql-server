@@ -9,14 +9,21 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "my_dir.h"
+#include "my_io.h"
+
+#include "storage/zset/zset_lsm.h"
 #include "storage/zset/zset_memtable.h"
+#include "storage/zset/zset_sstable.h"
 #include "storage/zset/zset_wal.h"
 
+using std::pair;
 using std::string;
 using std::vector;
 
@@ -96,9 +103,9 @@ TEST(ZsetSkiplistTest, NewestSeqFirst) {
 
   // Same (score, member): seq 3 must come first.
   ASSERT_NE(sl.first(), nullptr);
-  EXPECT_EQ(sl.first()->seq, 3U);
-  EXPECT_EQ(sl.next(sl.first())->seq, 2U);
-  EXPECT_EQ(sl.next(sl.next(sl.first()))->seq, 1U);
+  EXPECT_EQ(sl.first()->sequence, 3U);
+  EXPECT_EQ(sl.next(sl.first())->sequence, 2U);
+  EXPECT_EQ(sl.next(sl.next(sl.first()))->sequence, 1U);
 }
 
 // Random insertion with a sorted gold standard.
@@ -236,7 +243,9 @@ TEST(ZsetMemTableTest, ScoreChangeSingleLiveNode) {
   int x_count = 0;
   for (ZNode *n = mem.skiplist()->first(); n != nullptr;
        n = mem.skiplist()->next(n)) {
-    if (member_name(n) == "x") x_count++;
+    if (member_name(n) == "x") {
+      x_count++;
+    }
   }
   EXPECT_EQ(x_count, 3);  // PUT(1) + DELETE(1) + PUT(2), all kept
   ASSERT_NE(mem.firstLive(), nullptr);
@@ -260,7 +269,7 @@ TEST(ZsetMemTableTest, SameScoreReput) {
   EXPECT_EQ(score, 5.0);
   EXPECT_EQ(mem.skiplist()->count(), 2U);  // two versions kept
   ASSERT_NE(mem.firstLive(), nullptr);
-  EXPECT_EQ(mem.firstLive()->seq, 2U);
+  EXPECT_EQ(mem.firstLive()->sequence, 2U);
   EXPECT_EQ(mem.nextLive(mem.firstLive()), nullptr);
 }
 
@@ -721,9 +730,647 @@ TEST(ZsetWalTest, ManyRecordsReplay) {
 
   size_t expected = 0;
   for (int i = 0; i < kNum; i++) {
-    if (i % 3 != 0) expected++;
+    if (i % 3 != 0) {
+      expected++;
+    }
   }
   EXPECT_EQ(mem.count(), expected);
   wal2.close();
   unlink(kWalTestPath);
+}
+
+// Score encode/decode round-trips, including negatives and zero.
+TEST(ZsetSSTableTest, ScoreEncode) {
+  const double vals[] = {-1e6, -3.5, -0.0, 0.0, 0.5, 1.0, 2.5, 100.0, 1e6};
+  for (double v : vals) {
+    EXPECT_EQ(zset_decode_score(zset_encode_score(v)), v);
+  }
+  // Byte order of the encoding matches numeric order.
+  const uint64 a = zset_encode_score(-1.0);
+  const uint64 b = zset_encode_score(0.0);
+  const uint64 c = zset_encode_score(1.0);
+  EXPECT_LT(a, b);
+  EXPECT_LT(b, c);
+}
+
+// Write a sorted sequence, read it back in order with correct values.
+TEST(ZsetSSTableTest, RoundTrip) {
+  const char *path = "/tmp/zset_sst_test.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  ASSERT_EQ(w.append(1.0, m, len, 2, ZsetType::kPut),
+            0);  // newer version sorts first
+  m = member("a", &len);
+  ASSERT_EQ(w.append(1.0, m, len, 1, ZsetType::kPut), 0);
+  m = member("b", &len);
+  ASSERT_EQ(w.append(2.0, m, len, 1, ZsetType::kPut), 0);
+  m = member("c", &len);
+  ASSERT_EQ(w.append(2.0, m, len, 2, ZsetType::kDelete),
+            0);  // DELETE, newest of (2,c)
+  m = member("c", &len);
+  ASSERT_EQ(w.append(2.0, m, len, 1, ZsetType::kPut), 0);
+  ASSERT_EQ(w.finish(), 0);
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  ZsetSSTableReader::Iterator it;
+  it.seekToFirst(&r);
+
+  // Expected order: (1,a,s2,P) (1,a,s1,P) (2,b,s1,P) (2,c,s2,D) (2,c,s1,P).
+  struct Expect {
+    double score;
+    const char *member;
+    uint64 seq;
+    ZsetType type;
+  };
+  const Expect exp[] = {{1.0, "a", 2, ZsetType::kPut},
+                        {1.0, "a", 1, ZsetType::kPut},
+                        {2.0, "b", 1, ZsetType::kPut},
+                        {2.0, "c", 2, ZsetType::kDelete},
+                        {2.0, "c", 1, ZsetType::kPut}};
+  for (const Expect &e : exp) {
+    ASSERT_TRUE(it.valid());
+    EXPECT_EQ(it.entry().score, e.score);
+    EXPECT_EQ(string(it.entry().member.begin(), it.entry().member.end()),
+              e.member);
+    EXPECT_EQ(it.entry().sequence, e.seq);
+    EXPECT_EQ(it.entry().type, e.type);
+    it.next();
+  }
+  EXPECT_FALSE(it.valid());
+  r.close();
+  unlink(path);
+}
+
+// Seek lands on the first entry whose internal key is >= the target.
+TEST(ZsetSSTableTest, Seek) {
+  const char *path = "/tmp/zset_sst_test.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  uint len;
+  const uchar *m;
+  m = member("a", &len);
+  ASSERT_EQ(w.append(1.0, m, len, 1, ZsetType::kPut), 0);
+  m = member("b", &len);
+  ASSERT_EQ(w.append(2.0, m, len, 1, ZsetType::kPut), 0);
+  m = member("c", &len);
+  ASSERT_EQ(w.append(3.0, m, len, 1, ZsetType::kPut), 0);
+  m = member("d", &len);
+  ASSERT_EQ(w.append(4.0, m, len, 1, ZsetType::kPut), 0);
+  ASSERT_EQ(w.finish(), 0);
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  ZsetSSTableReader::Iterator it;
+
+  // Exact user key at max seq.
+  m = member("b", &len);
+  it.seek(&r, 2.0, m, len, ~0ULL, ZsetType::kPut);
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.entry().score, 2.0);
+  EXPECT_EQ(string(it.entry().member.begin(), it.entry().member.end()), "b");
+
+  // A key between existing ones lands on the next entry.
+  m = member("bb", &len);
+  it.seek(&r, 2.5, m, len, ~0ULL, ZsetType::kPut);
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(string(it.entry().member.begin(), it.entry().member.end()), "c");
+
+  // Past the end: invalid.
+  m = member("z", &len);
+  it.seek(&r, 10.0, m, len, ~0ULL, ZsetType::kPut);
+  EXPECT_FALSE(it.valid());
+  r.close();
+  unlink(path);
+}
+
+// Many entries across several data blocks and restart points.
+TEST(ZsetSSTableTest, MultiBlock) {
+  const char *path = "/tmp/zset_sst_test.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  const int kNum = 3000;
+  for (int i = 0; i < kNum; i++) {
+    string m = "member_" + std::to_string(i);
+    // Give every 10th row a second (newer) version.
+    const uchar *mb = reinterpret_cast<const uchar *>(m.data());
+    if (i % 10 == 0) {
+      ASSERT_EQ(
+          w.append(static_cast<double>(i), mb, m.size(), 2, ZsetType::kDelete),
+          0);
+    }
+    ASSERT_EQ(w.append(static_cast<double>(i), mb, m.size(), 1, ZsetType::kPut),
+              0);
+  }
+  ASSERT_EQ(w.finish(), 0);
+  EXPECT_GT(w.size(), 4096U);  // several blocks
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  ZsetSSTableReader::Iterator it;
+  it.seekToFirst(&r);
+  int n = 0;
+  for (; it.valid(); it.next(), n++) {
+    const double score = it.entry().score;
+    const int i = static_cast<int>(score);
+    const string m = string(it.entry().member.begin(), it.entry().member.end());
+    EXPECT_EQ(m, "member_" + std::to_string(i));
+    if (i % 10 == 0) {
+      // The DELETE (type 2) of this row is written at seq 2 and sorts
+      // before the PUT at seq 1, so it must appear first.
+      EXPECT_EQ(it.entry().type, ZsetType::kDelete);
+      EXPECT_EQ(it.entry().sequence, 2);
+      it.next();
+      EXPECT_TRUE(it.valid());
+      EXPECT_EQ(it.entry().type, ZsetType::kPut);
+      EXPECT_EQ(it.entry().sequence, 1);
+      n++;
+    } else {
+      EXPECT_EQ(it.entry().type, ZsetType::kPut);
+    }
+  }
+  EXPECT_EQ(n, kNum + kNum / 10);
+  r.close();
+  unlink(path);
+}
+
+// Extreme score ordering in the sortable encoding.
+TEST(ZsetSSTableTest, ScoreOrderingExtremes) {
+  const double vals[] = {-1e308, -1e100, -3.5, -1.0,  -0.0,
+                         0.0,    1.0,    2.5,  1e100, 1e308};
+  // Numeric order == byte order of the encoding.
+  for (size_t i = 1; i < sizeof(vals) / sizeof(vals[0]); i++) {
+    EXPECT_LT(zset_encode_score(vals[i - 1]), zset_encode_score(vals[i]));
+  }
+  // -inf and +inf are the extremes.
+  EXPECT_LT(zset_encode_score(-std::numeric_limits<double>::infinity()),
+            zset_encode_score(-1e308));
+  EXPECT_LT(zset_encode_score(1e308),
+            zset_encode_score(std::numeric_limits<double>::infinity()));
+}
+
+// Round-trip through the encoding preserves the exact bits, including
+// the NaN payload.
+TEST(ZsetSSTableTest, ScoreEncodeBits) {
+  const uint64 bits[] = {0x7FF8000000000000ULL,   // quiet NaN
+                         0xFFF8000000000001ULL,   // signaling NaN
+                         0x8000000000000000ULL,   // -0.0
+                         0x0000000000000000ULL,   // +0.0
+                         0x7FF0000000000000ULL,   // +inf
+                         0xFFF0000000000000ULL};  // -inf
+  for (uint64 b : bits) {
+    double d;
+    memcpy(&d, &b, sizeof(d));
+    const uint64 round =
+        zset_encode_score(zset_decode_score(zset_encode_score(d)));
+    EXPECT_EQ(round, zset_encode_score(d));
+  }
+}
+
+// An sstable with no entries.
+TEST(ZsetSSTableTest, EmptySst) {
+  const char *path = "/tmp/zset_sst_edge.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  ASSERT_EQ(w.finish(), 0);
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  ZsetSSTableReader::Iterator it;
+  it.seekToFirst(&r);
+  EXPECT_FALSE(it.valid());
+  r.close();
+  unlink(path);
+}
+
+// Members with an empty byte string and with embedded NUL bytes.
+TEST(ZsetSSTableTest, OddMembers) {
+  const char *path = "/tmp/zset_sst_edge.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  const uchar empty[] = "";
+  ASSERT_EQ(w.append(1.0, empty, 0, 1, ZsetType::kPut), 0);
+  const uchar bin[] = {0x00, 0x01, 0x00, 'x', 0x00};
+  ASSERT_EQ(w.append(2.0, bin, sizeof(bin), 1, ZsetType::kPut), 0);
+  const char *ab = "a";
+  ASSERT_EQ(
+      w.append(3.0, reinterpret_cast<const uchar *>(ab), 1, 1, ZsetType::kPut),
+      0);
+  ASSERT_EQ(w.finish(), 0);
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  ZsetSSTableReader::Iterator it;
+  it.seekToFirst(&r);
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.entry().member.size(), 0U);
+  EXPECT_EQ(it.entry().score, 1.0);
+  it.next();
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.entry().score, 2.0);
+  EXPECT_EQ(it.entry().member.size(), sizeof(bin));
+  EXPECT_EQ(memcmp(it.entry().member.data(), bin, sizeof(bin)), 0);
+  it.next();
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.entry().score, 3.0);
+  it.next();
+  EXPECT_FALSE(it.valid());
+  r.close();
+  unlink(path);
+}
+
+// A single entry larger than the block target (the block buffer grows).
+TEST(ZsetSSTableTest, OversizedEntry) {
+  const char *path = "/tmp/zset_sst_edge.sst";
+  unlink(path);
+  const size_t kLen = 5000;  // bigger than kBlockSize
+  std::vector<uchar> big(kLen);
+  for (size_t i = 0; i < kLen; i++) {
+    big[i] = static_cast<uchar>(i % 251);
+  }
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  ASSERT_EQ(w.append(1.0, big.data(), big.size(), 1, ZsetType::kPut), 0);
+  ASSERT_EQ(w.append(2.0, big.data(), big.size(), 1, ZsetType::kPut), 0);
+  ASSERT_EQ(w.finish(), 0);
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  ZsetSSTableReader::Iterator it;
+  it.seekToFirst(&r);
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.entry().score, 1.0);
+  EXPECT_EQ(it.entry().member.size(), kLen);
+  EXPECT_EQ(memcmp(it.entry().member.data(), big.data(), kLen), 0);
+  it.next();
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.entry().score, 2.0);
+  r.close();
+  unlink(path);
+}
+
+// Helpers for driving a ZsetLSM directly.
+
+static void lsm_put(ZsetLSM *lsm, const char *name, double score) {
+  uint len;
+  const uchar *m = member(name, &len);
+  lsm->put(score, m, len);
+}
+
+// Point read by member name.
+static bool lsm_get(ZsetLSM *lsm, const char *name, double *score) {
+  uint len;
+  const uchar *m = member(name, &len);
+  return lsm->get(m, len, score);
+}
+
+// Delete a member from the lsm.
+static void lsm_del(ZsetLSM *lsm, const char *name, double score) {
+  uint len;
+  const uchar *m = member(name, &len);
+  lsm->del(score, m, len);
+}
+
+// The merged live view as a (member, score) list.
+static vector<pair<string, double>> lsm_live(ZsetLSM *lsm, uint64 watermark) {
+  vector<pair<string, double>> out;
+  ZsetLSM::Iterator it;
+  it.seekToFirst(lsm, watermark);
+  while (it.valid()) {
+    out.push_back({string(it.key().member.begin(), it.key().member.end()),
+                   it.key().score});
+    it.next();
+  }
+  return out;
+}
+
+// Remove every file this lsm writes (the wal plus any flushed sstables).
+static void lsm_cleanup(const char *name) {
+  char path[FN_REFLEN];
+  snprintf(path, sizeof(path), "%s.zlog", name);
+  unlink(path);
+  char dir[FN_REFLEN];
+  size_t dir_len = 0;
+  dirname_part(dir, name, &dir_len);
+  MY_DIR *d = my_dir(dir, MYF(MY_WME));
+  if (d != nullptr) {
+    const char *base = base_name(name);
+    const std::string prefix = std::string(base) + "-";
+    for (size_t i = 0; i < d->number_off_files; i++) {
+      const char *fn = d->dir_entry[i].name;
+      const size_t flen = strlen(fn);
+      if (flen > prefix.size() + 4 &&
+          strncmp(fn, prefix.c_str(), prefix.size()) == 0 &&
+          strcmp(fn + flen - 4, ".sst") == 0) {
+        char fp[FN_REFLEN];
+        snprintf(fp, sizeof(fp), "%s/%s", dir, fn);
+        unlink(fp);
+      }
+    }
+    my_dirend(d);
+  }
+}
+
+// A fresh lsm (wal + any sstables removed) with a default open().
+static void lsm_open_clean(ZsetLSM *lsm, const char *name) {
+  lsm_cleanup(name);
+  ASSERT_EQ(lsm->open(name), 0);
+}
+
+// Merged live view over the memtable plus one flushed sstable.
+TEST(ZsetLSMTest, MergedView) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);
+  lsm_put(&lsm, "b", 2.0);
+
+  // Flush the memtable into an sstable; new writes land only in the
+  // memtable.
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_put(&lsm, "c", 3.0);
+  lsm_del(&lsm, "a", 1.0);
+
+  // Live view: b(2), c(3); a is tombstoned across mem+sst.
+  const vector<pair<string, double>> exp = {{"b", 2.0}, {"c", 3.0}};
+  EXPECT_EQ(lsm_live(&lsm, ~0ULL), exp);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// Merge across two flushed sstables plus the memtable, with versions
+// split between sources.
+TEST(ZsetLSMTest, MergeAcrossSources) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+
+  // Source 1: a(1), b(2).
+  lsm_put(&lsm, "a", 1.0);
+  lsm_put(&lsm, "b", 2.0);
+  ASSERT_EQ(lsm.flush(), 0);
+
+  // Source 2: b updated to 5.
+  lsm_del(&lsm, "b", 2.0);
+  lsm_put(&lsm, "b", 5.0);
+  ASSERT_EQ(lsm.flush(), 0);
+
+  // Memtable: c(10), delete a.
+  lsm_put(&lsm, "c", 10.0);
+  lsm_del(&lsm, "a", 1.0);
+
+  // b(5) wins over b(2); a is dead; c(10).
+  const vector<pair<string, double>> exp = {{"b", 5.0}, {"c", 10.0}};
+  EXPECT_EQ(lsm_live(&lsm, ~0ULL), exp);
+
+  // Seek from the merged view.
+  ZsetLSM::Iterator it;
+  uint len;
+  const uchar *m = member("c", &len);
+  it.seek(&lsm, 10.0, m, len, ~0ULL);
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.key().score, 10.0);
+  m = member("b", &len);
+  it.seek(&lsm, 2.0, m, len, ~0ULL);
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.key().score, 5.0);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// The watermark filters versions written after the scan started across
+// the merged view too.
+TEST(ZsetLSMTest, MergedSnapshot) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);  // seq 1
+  lsm_put(&lsm, "b", 2.0);  // seq 2
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_del(&lsm, "b", 2.0);   // seq 4
+  lsm_put(&lsm, "b", 20.0);  // seq 5
+
+  // Snapshot as of the flush: a(1), b(2) - the newer b is invisible.
+  const uint64 watermark = 3;
+  const vector<pair<string, double>> exp = {{"a", 1.0}, {"b", 2.0}};
+  EXPECT_EQ(lsm_live(&lsm, watermark), exp);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// Stress the merged live view: many members with versions split between
+// the memtable and the flushed sstable, some deletes, and a snapshot
+// watermark that hides the newest round.
+TEST(ZsetLSMTest, Stress) {
+  const char *name = "/tmp/zset_lsm_test";
+  const int kNum = 1000;
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+
+  // Round 1 (seq 1..kNum) goes into an sstable.
+  for (int i = 0; i < kNum; i++) {
+    string m = "m_" + std::to_string(i);
+    lsm.put(static_cast<double>(i), reinterpret_cast<const uchar *>(m.data()),
+            m.size());
+  }
+  ASSERT_EQ(lsm.flush(), 0);
+
+  // Round 2 (seq kNum+1..) in the memtable: update every 5th, delete
+  // every 10th.
+  for (int i = 0; i < kNum; i++) {
+    string m = "m_" + std::to_string(i);
+    const uchar *mb = reinterpret_cast<const uchar *>(m.data());
+    if (i % 10 == 0) {
+      lsm.del(static_cast<double>(i), mb, m.size());
+    } else if (i % 5 == 0) {
+      lsm.del(static_cast<double>(i), mb, m.size());
+      lsm.put(static_cast<double>(i) + 1000.0, mb, m.size());
+    }
+  }
+
+  // Live view without watermark: updated members moved, deleted gone.
+  vector<pair<string, double>> live = lsm_live(&lsm, ~0ULL);
+  EXPECT_EQ(live.size(), static_cast<size_t>(kNum - kNum / 10));
+  for (const auto &p : live) {
+    const int score = static_cast<int>(p.second);
+    const bool updated = score >= kNum;
+    const int i = updated ? score - kNum : score;
+    EXPECT_EQ(p.first, "m_" + std::to_string(i));
+  }
+
+  // Snapshot as of the first round: all original values, all rows.
+  vector<pair<string, double>> snap = lsm_live(&lsm, kNum + 1);
+  EXPECT_EQ(snap.size(), static_cast<size_t>(kNum));
+  for (size_t i = 0; i < snap.size(); i++) {
+    EXPECT_EQ(snap[i].second, static_cast<double>(i));
+  }
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// Merge with no sstables (pure memtable path).
+TEST(ZsetLSMTest, MergeOnlyMem) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);
+  lsm_put(&lsm, "b", 2.0);
+  lsm_del(&lsm, "a", 1.0);
+
+  const vector<pair<string, double>> exp = {{"b", 2.0}};
+  EXPECT_EQ(lsm_live(&lsm, ~0ULL), exp);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// Merge with an empty memtable and a tombstone in the sstable that
+// removes a member that the memtable re-adds.
+TEST(ZsetLSMTest, ReAddAfterDelete) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);  // seq 1
+  lsm_del(&lsm, "a", 1.0);  // seq 2
+  lsm_put(&lsm, "b", 2.0);  // seq 3
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_put(&lsm, "a", 5.0);  // seq 4: re-add a
+
+  // b(2) sorts before the re-added a(5).
+  const vector<pair<string, double>> exp = {{"b", 2.0}, {"a", 5.0}};
+  EXPECT_EQ(lsm_live(&lsm, ~0ULL), exp);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// The same user key written before and after the flush is emitted once.
+TEST(ZsetLSMTest, DuplicateInternalKey) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);  // seq 1 in the sstable after the flush
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_put(&lsm, "a", 1.0);  // seq 2 in the memtable
+
+  // The duplicate user key is emitted once.
+  const vector<pair<string, double>> exp = {{"a", 1.0}};
+  EXPECT_EQ(lsm_live(&lsm, ~0ULL), exp);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// Everything deleted across sources: the merged view is empty.
+TEST(ZsetLSMTest, AllDeleted) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);  // seq 1
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_del(&lsm, "a", 1.0);  // seq 2 tombstone
+
+  // Nothing survives: the merged view is empty.
+  EXPECT_TRUE(lsm_live(&lsm, ~0ULL).empty());
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// Seek to a user key that is dead (tombstoned) must land on the next
+// live key.
+TEST(ZsetLSMTest, SeekSkipsDeadKey) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);
+  lsm_put(&lsm, "b", 2.0);
+  lsm_put(&lsm, "c", 3.0);
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_del(&lsm, "b", 2.0);
+
+  // Seek to b: the dead key is skipped, landing on the next live one.
+  ZsetLSM::Iterator it;
+  uint len;
+  const uchar *m = member("b", &len);
+  it.seek(&lsm, 2.0, m, len, ~0ULL);
+  ASSERT_TRUE(it.valid());
+  EXPECT_EQ(it.key().score, 3.0);
+  EXPECT_EQ(string(it.key().member.begin(), it.key().member.end()), "c");
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// A tombstone with seq exactly at the watermark voids the key in the
+// snapshot. Sequences start at 1 on a fresh log, so the put is seq 2 and
+// the tombstone seq 3.
+TEST(ZsetLSMTest, WatermarkTombstoneBoundary) {
+  const char *name = "/tmp/zset_lsm_test";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);  // seq 2
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_del(&lsm, "a", 1.0);  // seq 3 tombstone
+
+  // As of seq 3 the tombstone is visible: a is gone.
+  EXPECT_TRUE(lsm_live(&lsm, 3).empty());
+
+  // As of seq 2 the delete had not happened yet: a is live.
+  const vector<pair<string, double>> exp = {{"a", 1.0}};
+  EXPECT_EQ(lsm_live(&lsm, 2), exp);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// Bloom filter basics: present members match, absent ones are rejected.
+TEST(ZsetBloomTest, Basic) {
+  ZsetBloomFilter f;
+  f.init(100);
+  std::string a = "apple";
+  std::string b = "banana";
+  f.add(reinterpret_cast<const uchar *>(a.data()), a.size());
+  f.add(reinterpret_cast<const uchar *>(b.data()), b.size());
+  EXPECT_TRUE(
+      f.may_contain(reinterpret_cast<const uchar *>(a.data()), a.size()));
+  EXPECT_TRUE(
+      f.may_contain(reinterpret_cast<const uchar *>(b.data()), b.size()));
+  int fps = 0;
+  for (int i = 0; i < 1000; i++) {
+    std::string q = "absent_" + std::to_string(i);
+    if (f.may_contain(reinterpret_cast<const uchar *>(q.data()), q.size())) {
+      fps++;
+    }
+  }
+  EXPECT_LT(fps, 100);  // false positives are rare
+}
+
+// A member that is not in the filter is rejected quickly, while present
+// members still match.
+TEST(ZsetSSTableTest, FilterSkipsAbsent) {
+  const char *path = "/tmp/zset_sst_filter.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  uint len;
+  const uchar *m;
+  m = member("apple", &len);
+  ASSERT_EQ(w.append(1.0, m, len, 1, ZsetType::kPut), 0);
+  m = member("banana", &len);
+  ASSERT_EQ(w.append(2.0, m, len, 1, ZsetType::kPut), 0);
+  ASSERT_EQ(w.finish(), 0);
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  m = member("apple", &len);
+  EXPECT_TRUE(r.may_contain(m, len));
+  m = member("banana", &len);
+  EXPECT_TRUE(r.may_contain(m, len));
+  m = member("cherry", &len);
+  EXPECT_FALSE(r.may_contain(m, len));
+  r.close();
+  unlink(path);
 }

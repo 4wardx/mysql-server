@@ -4,7 +4,7 @@
 #include "my_byteorder.h"
 #include "storage/zset/zset_wal.h"
 
-// Header size: magic(2) + type(1) + seq(8).
+// Header size: magic(2) + type(1) + sequence(8).
 static constexpr size_t kWalHeaderLen = 11;
 
 // fsync policy: 0 = fsync after every record, 1 = batched by the caller.
@@ -20,14 +20,18 @@ int Zset_wal::open(const char *path) {
   if (fd_ >= 0) {
     close();
   }
+
+  path_ = path;
   fd_ = my_open(path, O_CREAT | O_RDWR, MYF(MY_WME));
   if (fd_ < 0) {
     return 1;
   }
+
   if (my_seek(fd_, 0, MY_SEEK_END, MYF(0)) == MY_FILEPOS_ERROR) {
     close();
     return 1;
   }
+
   return 0;
 }
 
@@ -35,13 +39,29 @@ int Zset_wal::close() {
   if (fd_ < 0) {
     return 0;
   }
+
   int rc = my_close(fd_, MYF(0));
   fd_ = -1;
+
   return rc;
 }
 
-int Zset_wal::append(double score, const uchar *member, uint len, uint64 seq,
-                     Type type) {
+int Zset_wal::reset() {
+  if (fd_ < 0) {
+    return 1;
+  }
+
+  my_close(fd_, MYF(0));
+  fd_ = my_open(path_.c_str(), O_CREAT | O_RDWR | O_TRUNC, MYF(MY_WME));
+  if (fd_ < 0) {
+    return 1;
+  }
+
+  return 0;
+}
+
+int Zset_wal::append(double score, const uchar *member, uint len,
+                     uint64 sequence, Type type) {
   if (fd_ < 0) {
     return 1;
   }
@@ -49,7 +69,7 @@ int Zset_wal::append(double score, const uchar *member, uint len, uint64 seq,
   uchar header[kWalHeaderLen];
   int2store(header, kMagic);
   header[2] = static_cast<uint8_t>(type);
-  int8store(header + 3, seq);
+  int8store(header + 3, sequence);
 
   if (my_write(fd_, header, sizeof(header), MYF(MY_WME)) != sizeof(header)) {
     return 1;
@@ -86,7 +106,7 @@ int Zset_wal::append_clear() {
   uchar header[kWalHeaderLen];
   int2store(header, kMagic);
   header[2] = static_cast<uint8_t>(Type::kClear);
-  int8store(header + 3, 0);  // seq unused for CLEAR
+  int8store(header + 3, 0);  // sequence unused for CLEAR
   if (my_write(fd_, header, sizeof(header), MYF(MY_WME)) != sizeof(header)) {
     return 1;
   }
@@ -119,7 +139,7 @@ size_t Zset_wal::replay(ZsetMemTable *mem, uint64 *next_seq) {
     }
 
     const Type type = static_cast<Type>(header[2]);
-    const uint64 seq = uint8korr(header + 3);
+    const uint64 sequence = uint8korr(header + 3);
 
     if (type == Type::kClear) {
       mem->clear();
@@ -151,14 +171,14 @@ size_t Zset_wal::replay(ZsetMemTable *mem, uint64 *next_seq) {
     }
 
     if (type == Type::kPut) {
-      mem->put(score, member, member_len, seq);
+      mem->put(score, member, member_len, sequence);
     } else if (type == Type::kDelete) {
-      mem->tombstone(score, member, member_len, seq);
+      mem->tombstone(score, member, member_len, sequence);
     }
     delete[] member;
 
-    if (seq > max_seq) {
-      max_seq = seq;
+    if (sequence > max_seq) {
+      max_seq = sequence;
     }
     applied++;
   }

@@ -15,15 +15,15 @@
 #include "sql/handler.h" /* handler */
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 
+#include "storage/zset/zset_lsm.h"
 #include "storage/zset/zset_memtable.h"
+#include "storage/zset/zset_sstable.h"
 #include "storage/zset/zset_wal.h"
 
 /** @brief
-  Zset_share is a class that will be shared among all open handlers.
-  It owns the per-table state:
-    - ZsetMemTable mem: skiplist ordered by (score, member) plus the
-      member -> ZNode hash table, kept consistent on every mutation.
-    - THR_LOCK lock: the MySQL table lock.
+  Per-table state shared among all open handlers. The ZsetLSM owns every
+  storage detail (memtable, sstables, write-ahead log); the handler talks
+  only to it.
 */
 class Zset_share : public Handler_share {
   friend class ha_zset;
@@ -33,10 +33,7 @@ class Zset_share : public Handler_share {
   ~Zset_share() override { thr_lock_delete(&lock_); }
 
  private:
-  ZsetMemTable mem_;       ///< Versioned memtable
-  Zset_wal wal_;           ///< Write-ahead log
-  uint64 seq_ = 0;         ///< Sequence counter for internal keys
-  bool replayed_ = false;  ///< True once the WAL has been replayed
+  ZsetLSM lsm_;  ///< Engine core: memtable + sstables + wal
   THR_LOCK lock_;
 };
 
@@ -284,8 +281,14 @@ class ha_zset : public handler {
   int validate_schema(
       const TABLE *table) const;  ///< Verify the fixed ZSET table definition
 
-  // Pack member + score from a node back into the record buffer.
-  void fill_record(uchar *buf, ZNode *node);
+  // Pack a merged live key back into the record buffer.
+  void fill_record(uchar *buf, const ZsetLSM::Key &key);
+
+  // Pack member + score back into the record buffer.
+  void fill_record(uchar *buf, const uchar *member, uint len, double score);
+
+  // Flush the memtable to an sstable when it grows past the limit.
+  void maybe_flush();
 
   // Extract member bytes from the record buffer.
   static void decode_member(const TABLE *table, const uchar *buf,
@@ -298,8 +301,10 @@ class ha_zset : public handler {
   static void decode_index_key(const TABLE *table, uint idx, const uchar *key,
                                double *score, const uchar **m, uint *len);
 
-  THR_LOCK_DATA lock_;  ///< MySQL table lock
-  Zset_share *share_;   ///< Shared per-table state (memtable + lock)
-  ZNode *scan_pos_;     ///< rnd_next / index_next cursor
-  uint64 scan_seq_;     ///< Scan snapshot watermark (~0ULL = no filtering)
+  THR_LOCK_DATA lock_;      ///< MySQL table lock
+  Zset_share *share_;       ///< Shared per-table state (engine core + lock)
+  ZsetLSM::Iterator scan_;  ///< Forward merged scan cursor
+  std::vector<ZsetLSM::Key> rev_buf_;  ///< Reverse scan buffer
+  size_t rev_pos_ = 0;                 ///< Reverse scan position
+  uint64 scan_sequence_;  ///< Scan snapshot watermark (~0ULL = no filtering)
 };

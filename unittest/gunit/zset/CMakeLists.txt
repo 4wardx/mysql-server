@@ -11,6 +11,9 @@ SET(ZSET_UNIT_SOURCES
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_hashtable.cc
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_memtable.cc
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_wal.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_sstable.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_lsm.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_bloom.cc
 )
 
 MYSQL_ADD_EXECUTABLE(zset-t
@@ -30,6 +33,9 @@ SET(ZSET_BENCH_SOURCES
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_hashtable.cc
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_memtable.cc
   ${CMAKE_SOURCE_DIR}/storage/zset/zset_wal.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_sstable.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_lsm.cc
+  ${CMAKE_SOURCE_DIR}/storage/zset/zset_bloom.cc
 )
 
 MYSQL_ADD_EXECUTABLE(zset-bench

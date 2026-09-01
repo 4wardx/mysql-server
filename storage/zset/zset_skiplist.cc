@@ -3,6 +3,41 @@
 
 #include "storage/zset/zset_skiplist.h"
 
+int zset_compare_keys(double score_a, const uchar *member_a, uint len_a,
+                      uint64 seq_a, ZsetType type_a, double score_b,
+                      const uchar *member_b, uint len_b, uint64 seq_b,
+                      ZsetType type_b) {
+  if (score_a < score_b) {
+    return -1;
+  }
+  if (score_a > score_b) {
+    return 1;
+  }
+
+  uint n = len_a < len_b ? len_a : len_b;
+  int r = memcmp(member_a, member_b, n);
+  if (r != 0) {
+    return r;
+  }
+
+  if (len_a < len_b) {
+    return -1;
+  }
+  if (len_a > len_b) {
+    return 1;
+  }
+
+  // Same (score, member): newer sequence first.
+  if (seq_a > seq_b) {
+    return -1;
+  }
+  if (seq_a < seq_b) {
+    return 1;
+  }
+
+  return static_cast<int>(type_a) < static_cast<int>(type_b) ? -1 : 1;
+}
+
 ZNode *ZNode::next(int n) const {
   assert(n >= 0);
   return next_[n].load(std::memory_order_acquire);
@@ -41,9 +76,9 @@ ZsetSkiplist::~ZsetSkiplist() {
 }
 
 ZNode *ZsetSkiplist::insert(double score, const uchar *member, uint len,
-                            uint64 seq, ZsetType type) {
+                            uint64 sequence, ZsetType type) {
   ZNode *pred[kMaxHeight];
-  ZNode *x = findLowerBound(score, member, len, seq, type, pred);
+  findLowerBound(score, member, len, sequence, type, pred);
 
   int level = randomLevel();
   if (level > currentHeight()) {
@@ -53,7 +88,7 @@ ZNode *ZsetSkiplist::insert(double score, const uchar *member, uint len,
     top_level_.store(level, std::memory_order_relaxed);
   }
 
-  ZNode *node = createNode(score, member, len, seq, type, level);
+  ZNode *node = createNode(score, member, len, sequence, type, level);
   for (int i = 0; i < level; i++) {
     node->setNextRelaxed(i, pred[i]->nextRelaxed(i));
     pred[i]->setNext(i, node);
@@ -158,49 +193,14 @@ int ZsetSkiplist::randomLevel() {
   return level;
 }
 
-int ZsetSkiplist::compare(double score_a, const uchar *member_a, uint len_a,
-                          uint64 seq_a, ZsetType type_a, double score_b,
-                          const uchar *member_b, uint len_b, uint64 seq_b,
-                          ZsetType type_b) {
-  if (score_a < score_b) {
-    return -1;
-  }
-  if (score_a > score_b) {
-    return 1;
-  }
-
-  uint n = len_a < len_b ? len_a : len_b;
-  int r = memcmp(member_a, member_b, n);
-  if (r != 0) {
-    return r;
-  }
-
-  if (len_a < len_b) {
-    return -1;
-  }
-  if (len_a > len_b) {
-    return 1;
-  }
-
-  // Same (score, member): newer sequence first.
-  if (seq_a > seq_b) {
-    return -1;
-  }
-  if (seq_a < seq_b) {
-    return 1;
-  }
-
-  return static_cast<int>(type_a) < static_cast<int>(type_b) ? -1 : 1;
-}
-
 ZNode *ZsetSkiplist::createNode(double score, const uchar *member, uint len,
-                                uint64 seq, ZsetType type, int level) {
+                                uint64 sequence, ZsetType type, int level) {
   size_t bytes = sizeof(ZNode) + sizeof(std::atomic<ZNode *>) * (level - 1);
   ZNode *node = (ZNode *)malloc(bytes);
   node->score = score;
   node->member = nullptr;
   node->member_len = len;
-  node->seq = seq;
+  node->sequence = sequence;
   node->type = type;
   node->level = level;
   node->backward = nullptr;
@@ -225,17 +225,18 @@ bool ZsetSkiplist::keysEqual(double score_a, const uchar *member_a, uint len_a,
 }
 
 bool ZsetSkiplist::keyGreaterThan(double score, const uchar *member, uint len,
-                                  uint64 seq, ZsetType type, ZNode *n) {
-  return n != nullptr && compare(n->score, n->member, n->member_len, n->seq,
-                                 n->type, score, member, len, seq, type) < 0;
+                                  uint64 sequence, ZsetType type, ZNode *n) {
+  return n != nullptr &&
+         zset_compare_keys(n->score, n->member, n->member_len, n->sequence,
+                           n->type, score, member, len, sequence, type) < 0;
 }
 
 ZNode *ZsetSkiplist::findLowerBound(double score, const uchar *member, uint len,
-                                    uint64 seq, ZsetType type,
+                                    uint64 sequence, ZsetType type,
                                     ZNode **pred) const {
   ZNode *x = head_;
   for (int i = currentHeight() - 1; i >= 0; i--) {
-    while (keyGreaterThan(score, member, len, seq, type, x->next(i))) {
+    while (keyGreaterThan(score, member, len, sequence, type, x->next(i))) {
       x = x->next(i);
     }
     if (pred != nullptr) {
@@ -251,9 +252,10 @@ ZNode *ZsetSkiplist::findPredecessor(double score, const uchar *member,
   ZNode *x = head_;
   for (int i = currentHeight() - 1; i >= 0; i--) {
     while (x->next(i) != nullptr &&
-           compare(x->next(i)->score, x->next(i)->member,
-                   x->next(i)->member_len, x->next(i)->seq, x->next(i)->type,
-                   score, member, len, x->next(i)->seq, x->next(i)->type) < 0) {
+           zset_compare_keys(x->next(i)->score, x->next(i)->member,
+                             x->next(i)->member_len, x->next(i)->sequence,
+                             x->next(i)->type, score, member, len,
+                             x->next(i)->sequence, x->next(i)->type) < 0) {
       x = x->next(i);
     }
   }

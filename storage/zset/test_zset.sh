@@ -132,7 +132,17 @@ if [ $? -eq 0 ]; then
 	failures=$((failures + 1))
 fi
 
-# 9. Crash recovery: kill -9, restart, data must survive (WAL replay).
+# 9. Load test: bulk INSERT across a flush boundary into the same table,
+#    then verify the flushed rows are queryable alongside the earlier ones.
+sql "bulk INSERT 110K (flush at 100K)" -e \
+	"SET SESSION cte_max_recursion_depth=200000; INSERT INTO ztest.t (member,score) WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<110000) SELECT CONCAT('m_',LPAD(n,7,'0')), n FROM s;"
+check "row count after load" "110004" -e "SELECT COUNT(*) FROM ztest.t;"
+check "flushed member point lookup" "1" -e "SELECT score FROM ztest.t WHERE member='m_0000001';"
+check "post-flush member point lookup" "100001" -e "SELECT score FROM ztest.t WHERE member='m_0100001';"
+check "pre-load member still intact" "0.5" -e "SELECT score FROM ztest.t WHERE member='apple';"
+check "descending range top" "m_0110000" -e "SELECT member FROM ztest.t ORDER BY score DESC LIMIT 1;"
+
+# 10. Crash recovery: kill -9, restart, data must survive (WAL replay).
 kill -9 "$MYSQLD_PID" 2>/dev/null
 wait "$MYSQLD_PID" 2>/dev/null
 sleep 1
@@ -146,11 +156,13 @@ for _ in $(seq 1 60); do
 	"$BIN/mysqladmin" --socket="$SOCK" -uroot ping >/dev/null 2>&1 && break
 	sleep 0.5
 done
-check "crash recovery row count" "4" -e "SELECT COUNT(*) FROM ztest.t;"
+check "crash recovery row count" "110004" -e "SELECT COUNT(*) FROM ztest.t;"
 check "crash recovery update persisted" "0.5" \
 	-e "SELECT score FROM ztest.t WHERE member='apple';"
+check "crash recovery flushed row" "100001" \
+	-e "SELECT score FROM ztest.t WHERE member='m_0100001';"
 
-# 10. Truncate / drop.
+# 11. Truncate / drop.
 sql "TRUNCATE" -e "TRUNCATE TABLE ztest.t;"
 check "after truncate" "0" -e "SELECT COUNT(*) FROM ztest.t;"
 sql "DROP TABLE" -e "DROP TABLE ztest.t;"

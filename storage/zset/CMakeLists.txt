@@ -9,6 +9,9 @@ if(WITH_ZSET_STORAGE_ENGINE AND NOT WITHOUT_ZSET_STORAGE_ENGINE)
     zset_hashtable.cc
     zset_memtable.cc
     zset_wal.cc
+    zset_sstable.cc
+    zset_lsm.cc
+    zset_bloom.cc
     STORAGE_ENGINE
     DEFAULT
     LINK_LIBRARIES
@@ -22,6 +25,9 @@ elseif(NOT WITHOUT_ZSET_STORAGE_ENGINE)
     zset_hashtable.cc
     zset_memtable.cc
     zset_wal.cc
+    zset_sstable.cc
+    zset_lsm.cc
+    zset_bloom.cc
     STORAGE_ENGINE
     MODULE_ONLY
     LINK_LIBRARIES

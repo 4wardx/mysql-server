@@ -16,6 +16,7 @@
 
 #include "my_byteorder.h"
 #include "my_dbug.h"
+#include "my_dir.h"
 #include "mysql/plugin.h"
 #include "sql/field.h"
 #include "sql/sql_class.h"
@@ -28,13 +29,11 @@ handlerton *zset_hton;
 // WAL fsync policy, defined in zset_wal.cc.
 extern ulong zset_wal_fsync;
 
+// Flush the memtable when it holds more internal keys than this.
+static constexpr size_t kMemtableLimit = 100'000;
+
 // Table file extensions, for DROP/repair discovery.
 static const char *zset_file_exts[] = {".zlog", nullptr};
-
-// Build the <table>.zlog path from the table name.
-static void make_wal_path(char *buf, size_t buflen, const char *name) {
-  fn_format(buf, name, "", ".zlog", MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-}
 
 // ZSET owns no system tables, so this always returns false.
 static bool zset_is_supported_system_table(const char *, const char *, bool) {
@@ -108,7 +107,7 @@ mysql_declare_plugin(zset){
 Zset_share::Zset_share() { thr_lock_init(&lock_); }
 
 ha_zset::ha_zset(handlerton *hton, TABLE_SHARE *table_arg)
-    : handler(hton, table_arg), share_(nullptr), scan_pos_(nullptr) {}
+    : handler(hton, table_arg), share_(nullptr) {}
 
 // ============================================================================
 // Lifecycle
@@ -121,8 +120,9 @@ int ha_zset::create(const char *name, TABLE *form, HA_CREATE_INFO *,
     return rc;
   }
 
+  // Create the empty log file so DROP discovers the table's files.
   char path[FN_REFLEN];
-  make_wal_path(path, sizeof(path), name);
+  fn_format(path, name, "", ".zlog", MY_REPLACE_EXT | MY_UNPACK_FILENAME);
   File fd = my_open(path, O_CREAT | O_RDWR, MYF(MY_WME));
   if (fd < 0) {
     return HA_ERR_CRASHED;
@@ -139,19 +139,10 @@ int ha_zset::open(const char *name, int, uint, const dd::Table *) {
   }
 
   thr_lock_data_init(&share_->lock_, &lock_, nullptr);
-  scan_pos_ = nullptr;
+  scan_sequence_ = ~0ULL;
 
-  if (!share_->replayed_) {
-    char path[FN_REFLEN];
-    make_wal_path(path, sizeof(path), name);
-
-    int rc = share_->wal_.open(path);
-    if (rc) {
-      return HA_ERR_CRASHED;
-    }
-
-    share_->wal_.replay(&share_->mem_, &share_->seq_);
-    share_->replayed_ = true;
+  if (share_->lsm_.open(name) != 0) {
+    return HA_ERR_CRASHED;
   }
 
   return 0;
@@ -159,17 +150,37 @@ int ha_zset::open(const char *name, int, uint, const dd::Table *) {
 
 int ha_zset::close(void) {
   DBUG_TRACE;
-  scan_pos_ = nullptr;
   return 0;
 }
 
 int ha_zset::delete_table(const char *name, const dd::Table *) {
   DBUG_TRACE;
+  // Remove the log and any flushed sstable files.
   char path[FN_REFLEN];
-  make_wal_path(path, sizeof(path), name);
+  fn_format(path, name, "", ".zlog", MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+  my_delete(path, MYF(0));
 
-  if (my_delete(path, MYF(0))) {
-    return HA_ERR_CRASHED;
+  char dir[FN_REFLEN];
+  size_t dir_len = 0;
+  dirname_part(dir, name, &dir_len);
+  MY_DIR *d = my_dir(dir, MYF(MY_WME));
+  if (d != nullptr) {
+    const char *base = base_name(name);
+    const std::string prefix = std::string(base) + "-";
+
+    for (size_t i = 0; i < d->number_off_files; i++) {
+      const char *fn = d->dir_entry[i].name;
+      const size_t flen = strlen(fn);
+
+      if (flen > prefix.size() + 4 &&
+          strncmp(fn, prefix.c_str(), prefix.size()) == 0 &&
+          strcmp(fn + flen - 4, ".sst") == 0) {
+        snprintf(path, sizeof(path), "%s/%s", dir, fn);
+        my_delete(path, MYF(0));
+      }
+    }
+
+    my_dirend(d);
   }
 
   return 0;
@@ -183,13 +194,10 @@ int ha_zset::rename_table(const char *, const char *, const dd::Table *,
 
 int ha_zset::truncate(dd::Table *) {
   DBUG_TRACE;
-
-  // Persist a CLEAR marker first, then drop the in-memory state.
-  int rc = share_->wal_.append_clear();
-  if (rc) {
-    return rc;
+  if (share_->lsm_.clear() != 0) {
+    return HA_ERR_CRASHED;
   }
-  share_->mem_.clear();
+
   stats.records = 0;
 
   return 0;
@@ -208,19 +216,12 @@ int ha_zset::write_row(uchar *buf) {
 
   // Member is the primary key and must be unique.
   double old_score;
-  if (share_->mem_.get(m, len, &old_score)) {
+  if (share_->lsm_.get(m, len, &old_score)) {
     return HA_ERR_FOUND_DUPP_KEY;
   }
 
-  // Write-ahead: persist the PUT record first, then apply to the memtable.
-  const uint64 seq = ++share_->seq_;
-  if (share_->wal_.append(score, m, len, seq, Zset_wal::Type::kPut)) {
-    return HA_ERR_CRASHED;
-  }
-
-  share_->mem_.put(score, m, len, seq);
-  stats.records = share_->mem_.count();
-
+  share_->lsm_.put(score, m, len);
+  maybe_flush();
   return 0;
 }
 
@@ -236,32 +237,17 @@ int ha_zset::update_row(const uchar *old_data, uchar *new_data) {
   double score = decode_score(table, new_data);
 
   double old_score;
-  const bool member_exists = share_->mem_.get(old_m, old_len, &old_score);
+  const bool member_exists = share_->lsm_.get(old_m, old_len, &old_score);
   const bool same_member =
       old_len == new_len && memcmp(old_m, new_m, new_len) == 0;
 
-  // Write-ahead first. Tombstone the old entry when the score changes.
-  const uint64 seq = ++share_->seq_;
-  if (member_exists && !same_member) {
-    if (share_->wal_.append(old_score, old_m, old_len, seq,
-                            Zset_wal::Type::kDelete)) {
-      return HA_ERR_CRASHED;
-    }
-    share_->mem_.tombstone(old_score, old_m, old_len, seq);
-  } else if (member_exists && old_score != score) {
-    if (share_->wal_.append(old_score, old_m, old_len, seq,
-                            Zset_wal::Type::kDelete)) {
-      return HA_ERR_CRASHED;
-    }
-    share_->mem_.tombstone(old_score, old_m, old_len, seq);
+  // Tombstone the old entry when the key or the score changes, then write
+  // the new version.
+  if (member_exists && (!same_member || old_score != score)) {
+    share_->lsm_.del(old_score, old_m, old_len);
   }
-
-  if (share_->wal_.append(score, new_m, new_len, seq, Zset_wal::Type::kPut)) {
-    return HA_ERR_CRASHED;
-  }
-
-  share_->mem_.put(score, new_m, new_len, seq);
-  stats.records = share_->mem_.count();
+  share_->lsm_.put(score, new_m, new_len);
+  maybe_flush();
 
   return 0;
 }
@@ -273,30 +259,22 @@ int ha_zset::delete_row(const uchar *buf) {
   decode_member(table, buf, &m, &len);
 
   double score;
-  if (!share_->mem_.get(m, len, &score)) {
+  if (!share_->lsm_.get(m, len, &score)) {
     return 0;  // already gone
   }
 
-  // Write-ahead: persist the DELETE tombstone first, then apply.
-  const uint64 seq = ++share_->seq_;
-  if (share_->wal_.append(score, m, len, seq, Zset_wal::Type::kDelete)) {
-    return HA_ERR_CRASHED;
-  }
-  share_->mem_.tombstone(score, m, len, seq);
-  stats.records = share_->mem_.count();
+  share_->lsm_.del(score, m, len);
+  maybe_flush();
 
   return 0;
 }
 
 int ha_zset::delete_all_rows(void) {
   DBUG_TRACE;
-
-  int rc = share_->wal_.append_clear();
-  if (rc) {
-    return rc;
+  if (share_->lsm_.clear() != 0) {
+    return HA_ERR_CRASHED;
   }
 
-  share_->mem_.clear();
   stats.records = 0;
 
   return 0;
@@ -311,22 +289,19 @@ int ha_zset::index_read_map(uchar *buf, const uchar *key,
                             enum ha_rkey_function find_flag) {
   DBUG_TRACE;
   if (active_index == 0) {
-    // PRIMARY: whole-key point lookup via the hash table.
+    // PRIMARY: whole-key point lookup via the engine.
     uint mlen = uint2korr(key);
     const uchar *m = key + 2;
-    ZNode *node = share_->mem_.lookup(m, mlen);
-
-    if (node == nullptr) {
+    double score;
+    if (!share_->lsm_.get(m, mlen, &score)) {
       return HA_ERR_KEY_NOT_FOUND;
     }
 
-    fill_record(buf, node);
-    scan_pos_ = share_->mem_.nextLive(node, scan_seq_);
-
+    fill_record(buf, m, mlen, score);
     return 0;
   }
 
-  // idx_score: position the cursor at the lower bound.
+  // idx_score: position the merged cursor at the lower bound.
   double score = float8get(key);
   const uchar *m = nullptr;
   uint len = 0;
@@ -335,77 +310,84 @@ int ha_zset::index_read_map(uchar *buf, const uchar *key,
     m = key + 8 + 2;
   }
 
-  scan_pos_ = share_->mem_.seekLive(score, m, len, scan_seq_);
-  if (scan_pos_ == nullptr) {
+  scan_.seek(&share_->lsm_, score, m, len, scan_sequence_);
+  if (!scan_.valid()) {
     return HA_ERR_KEY_NOT_FOUND;
   }
 
   if (find_flag == HA_READ_KEY_EXACT) {
-    if (scan_pos_->score != score) {
-      scan_pos_ = nullptr;
-
+    if (scan_.key().score != score) {
       return HA_ERR_KEY_NOT_FOUND;
     }
+
     // For a prefix key (score only) the member is not part of the key.
     if (keypart_map == HA_WHOLE_KEY &&
-        (scan_pos_->member_len != len ||
-         memcmp(scan_pos_->member, m, len) != 0)) {
-      scan_pos_ = nullptr;
-
+        (scan_.key().member.size() != len ||
+         memcmp(scan_.key().member.data(), m, len) != 0)) {
       return HA_ERR_KEY_NOT_FOUND;
     }
   }
 
-  fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
-
+  fill_record(buf, scan_.key());
+  scan_.next();
   return 0;
 }
 
 int ha_zset::index_next(uchar *buf) {
   DBUG_TRACE;
-  if (scan_pos_ == nullptr) {
+  if (!scan_.valid()) {
     return HA_ERR_END_OF_FILE;
   }
 
-  fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
+  fill_record(buf, scan_.key());
+  scan_.next();
 
   return 0;
 }
 
 int ha_zset::index_prev(uchar *buf) {
   DBUG_TRACE;
-  if (scan_pos_ == nullptr) {
+  if (rev_pos_ == static_cast<size_t>(-1)) {
     return HA_ERR_END_OF_FILE;
   }
 
-  fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.prevLive(scan_pos_, scan_seq_);
+  fill_record(buf, rev_buf_[rev_pos_]);
+  rev_pos_--;
 
   return 0;
 }
 
 int ha_zset::index_first(uchar *buf) {
   DBUG_TRACE;
-  scan_pos_ = share_->mem_.firstLive(scan_seq_);
-  if (scan_pos_ == nullptr) {
+  scan_.seekToFirst(&share_->lsm_, scan_sequence_);
+  if (!scan_.valid()) {
     return HA_ERR_END_OF_FILE;
   }
-  fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
+
+  fill_record(buf, scan_.key());
+  scan_.next();
 
   return 0;
 }
 
 int ha_zset::index_last(uchar *buf) {
   DBUG_TRACE;
-  scan_pos_ = share_->mem_.lastLive(scan_seq_);
-  if (scan_pos_ == nullptr) {
+  rev_buf_.clear();
+  ZsetLSM::Iterator it;
+
+  it.seekToFirst(&share_->lsm_, scan_sequence_);
+  while (it.valid()) {
+    rev_buf_.push_back(it.key());
+    it.next();
+  }
+
+  if (rev_buf_.empty()) {
     return HA_ERR_END_OF_FILE;
   }
-  fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.prevLive(scan_pos_, scan_seq_);
+
+  rev_pos_ = rev_buf_.size() - 1;
+  fill_record(buf, rev_buf_[rev_pos_]);
+  rev_pos_--;
 
   return 0;
 }
@@ -416,16 +398,15 @@ int ha_zset::index_last(uchar *buf) {
 
 int ha_zset::rnd_init(bool) {
   DBUG_TRACE;
-  scan_seq_ = share_->seq_;
-  scan_pos_ = share_->mem_.firstLive(scan_seq_);
+  scan_sequence_ = share_->lsm_.sequence();
+  scan_.seekToFirst(&share_->lsm_, scan_sequence_);
   return 0;
 }
 
 int ha_zset::index_init(uint idx, bool) {
   DBUG_TRACE;
   active_index = idx;
-  scan_seq_ = share_->seq_;
-  scan_pos_ = nullptr;
+  scan_sequence_ = share_->lsm_.sequence();
   return 0;
 }
 
@@ -436,12 +417,12 @@ int ha_zset::rnd_end() {
 
 int ha_zset::rnd_next(uchar *buf) {
   DBUG_TRACE;
-  if (scan_pos_ == nullptr) {
+  if (!scan_.valid()) {
     return HA_ERR_END_OF_FILE;
   }
 
-  fill_record(buf, scan_pos_);
-  scan_pos_ = share_->mem_.nextLive(scan_pos_, scan_seq_);
+  fill_record(buf, scan_.key());
+  scan_.next();
 
   return 0;
 }
@@ -450,13 +431,13 @@ int ha_zset::rnd_pos(uchar *buf, uchar *pos) {
   DBUG_TRACE;
   uint len = uint2korr(pos);
   const uchar *m = pos + 2;
-  ZNode *node = share_->mem_.lookup(m, len);
+  double score;
 
-  if (node == nullptr) {
+  if (!share_->lsm_.get(m, len, &score)) {
     return HA_ERR_KEY_NOT_FOUND;
   }
 
-  fill_record(buf, node);
+  fill_record(buf, m, len, score);
 
   return 0;
 }
@@ -478,9 +459,12 @@ void ha_zset::position(const uchar *record) {
 int ha_zset::info(uint flag) {
   DBUG_TRACE;
   if (share_) {
-    stats.records = share_->mem_.count();
+    stats.records = share_->lsm_.count();
+  }
+  if (share_) {
     stats.data_file_length = stats.records * 265;
   }
+
   if (flag & HA_STATUS_ERRKEY) {
     errkey = 0;  // Duplicates can only happen on the PRIMARY KEY.
   }
@@ -506,7 +490,19 @@ ha_rows ha_zset::records_in_range(uint inx, key_range *min_key,
     double min_s = float8get(min_key->key);
     double max_s = float8get(max_key->key);
 
-    return static_cast<ha_rows>(share_->mem_.countLiveInRange(min_s, max_s));
+    // Count live rows in the score range across the whole LSM.
+    ha_rows n = 0;
+    ZsetLSM::Iterator it;
+    it.seekToFirst(&share_->lsm_, ~0ULL);
+
+    while (it.valid()) {
+      if (it.key().score >= min_s && it.key().score <= max_s) {
+        n++;
+      }
+      it.next();
+    }
+
+    return n;
   }
 
   return 10;  // low number to force index usage
@@ -524,6 +520,9 @@ THR_LOCK_DATA **ha_zset::store_lock(THD *, THR_LOCK_DATA **to,
 // ============================================================================
 // Internal functions
 // ============================================================================
+
+// Flush the memtable to an sstable once it holds more internal keys than
+// the limit.
 
 Zset_share *ha_zset::get_share() {
   Zset_share *tmp_share;
@@ -557,6 +556,7 @@ int ha_zset::validate_schema(const TABLE *table) const {
   if (key0->user_defined_key_parts != 1 || key1->user_defined_key_parts != 2) {
     return HA_ERR_WRONG_COMMAND;
   }
+
   if (table->field[1]->type() != MYSQL_TYPE_DOUBLE) {
     return HA_ERR_WRONG_COMMAND;
   }
@@ -564,7 +564,13 @@ int ha_zset::validate_schema(const TABLE *table) const {
   return 0;
 }
 
-void ha_zset::fill_record(uchar *buf, ZNode *node) {
+void ha_zset::fill_record(uchar *buf, const ZsetLSM::Key &key) {
+  fill_record(buf, reinterpret_cast<const uchar *>(key.member.data()),
+              key.member.size(), key.score);
+}
+
+void ha_zset::fill_record(uchar *buf, const uchar *member, uint len,
+                          double score) {
   // store() asserts that the field is in table->write_set; reads must
   // temporarily mark all columns (same pattern as ha_tina).
   my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->write_set);
@@ -580,10 +586,10 @@ void ha_zset::fill_record(uchar *buf, ZNode *node) {
   }
 
   table->field[0]->set_notnull();
-  table->field[0]->store(reinterpret_cast<const char *>(node->member),
-                         node->member_len, &my_charset_bin);
+  table->field[0]->store(reinterpret_cast<const char *>(member), len,
+                         &my_charset_bin);
   table->field[1]->set_notnull();
-  table->field[1]->store(node->score);
+  table->field[1]->store(score);
   if (delta != 0) {
     for (uint i = 0; i < table->s->fields; i++) {
       table->field[i]->move_field_offset(-delta);
@@ -591,6 +597,12 @@ void ha_zset::fill_record(uchar *buf, ZNode *node) {
   }
 
   dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+}
+
+void ha_zset::maybe_flush() {
+  if (share_->lsm_.mem_size() > kMemtableLimit) {
+    share_->lsm_.flush();
+  }
 }
 
 void ha_zset::decode_member(const TABLE *table, const uchar *buf,

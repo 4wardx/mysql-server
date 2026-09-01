@@ -3,15 +3,15 @@
 #include <cstring>
 
 ZNode *ZsetMemTable::put(double score, const uchar *member, uint len,
-                         uint64 seq) {
-  ZNode *node = skiplist_.insert(score, member, len, seq, ZsetType::kPut);
+                         uint64 sequence) {
+  ZNode *node = skiplist_.insert(score, member, len, sequence, ZsetType::kPut);
   hashtable_.insert(member, len, node);
   return node;
 }
 
 void ZsetMemTable::tombstone(double score, const uchar *member, uint len,
-                             uint64 seq) {
-  skiplist_.insert(score, member, len, seq, ZsetType::kDelete);
+                             uint64 sequence) {
+  skiplist_.insert(score, member, len, sequence, ZsetType::kDelete);
   hashtable_.remove(member, len);
 }
 
@@ -159,7 +159,7 @@ ZNode *ZsetMemTable::newestVersion(ZNode *n) const {
 
 ZNode *ZsetMemTable::activeVersion(ZNode *n, uint64 max_seq) const {
   ZNode *active = n;
-  while (active != nullptr && active->seq > max_seq) {
+  while (active != nullptr && active->sequence > max_seq) {
     active = skiplist_.next(active);
     if (active != nullptr && !sameUserKey(active, n)) {
       return nullptr;  // every version is newer than max_seq
