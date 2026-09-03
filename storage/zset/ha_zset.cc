@@ -230,20 +230,22 @@ int ha_zset::update_row(const uchar *old_data, uchar *new_data) {
   const uchar *old_m;
   uint old_len;
   decode_member(table, old_data, &old_m, &old_len);
+  const double old_score = decode_score(table, old_data);
 
   const uchar *new_m;
   uint new_len;
   decode_member(table, new_data, &new_m, &new_len);
   double score = decode_score(table, new_data);
 
-  double old_score;
-  const bool member_exists = share_->lsm_.get(old_m, old_len, &old_score);
   const bool same_member =
       old_len == new_len && memcmp(old_m, new_m, new_len) == 0;
 
   // Tombstone the old entry when the key or the score changes, then write
-  // the new version.
-  if (member_exists && (!same_member || old_score != score)) {
+  // the new version. The old score comes from the record the handler was
+  // asked to replace, so no point lookup is needed: an UPDATE always
+  // operates on a row that already exists, and a point lookup on flushed
+  // data would fall back to a full merged scan per row.
+  if (!same_member || old_score != score) {
     share_->lsm_.del(old_score, old_m, old_len);
   }
   share_->lsm_.put(score, new_m, new_len);
@@ -400,6 +402,7 @@ int ha_zset::rnd_init(bool) {
   DBUG_TRACE;
   scan_sequence_ = share_->lsm_.sequence();
   scan_.seekToFirst(&share_->lsm_, scan_sequence_);
+  active_scans_++;
   return 0;
 }
 
@@ -407,11 +410,25 @@ int ha_zset::index_init(uint idx, bool) {
   DBUG_TRACE;
   active_index = idx;
   scan_sequence_ = share_->lsm_.sequence();
+  active_scans_++;
+  return 0;
+}
+
+int ha_zset::index_end() {
+  DBUG_TRACE;
+  if (active_scans_ > 0) {
+    active_scans_--;
+  }
+  flush_pending_if_idle();
   return 0;
 }
 
 int ha_zset::rnd_end() {
   DBUG_TRACE;
+  if (active_scans_ > 0) {
+    active_scans_--;
+  }
+  flush_pending_if_idle();
   return 0;
 }
 
@@ -601,6 +618,19 @@ void ha_zset::fill_record(uchar *buf, const uchar *member, uint len,
 
 void ha_zset::maybe_flush() {
   if (share_->lsm_.mem_size() > kMemtableLimit) {
+    // A flush clears the memtable, freeing the nodes an in-flight scan
+    // cursor may still point at. Defer it until the scans finish.
+    if (active_scans_ > 0) {
+      flush_pending_ = true;
+      return;
+    }
+    share_->lsm_.flush();
+  }
+}
+
+void ha_zset::flush_pending_if_idle() {
+  if (flush_pending_ && active_scans_ == 0) {
+    flush_pending_ = false;
     share_->lsm_.flush();
   }
 }

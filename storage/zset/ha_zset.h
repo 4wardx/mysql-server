@@ -232,6 +232,11 @@ class ha_zset : public handler {
   int index_init(uint idx, bool sorted) override;
 
   /** @brief
+    End an index scan.
+   */
+  int index_end() override;
+
+  /** @brief
     End a sequential scan.
    */
   int rnd_end() override;
@@ -290,6 +295,10 @@ class ha_zset : public handler {
   // Flush the memtable to an sstable when it grows past the limit.
   void maybe_flush();
 
+  // Perform a deferred flush once no scan holds a cursor into the
+  // memtable (a flush frees the memtable nodes a scan is walking).
+  void flush_pending_if_idle();
+
   // Extract member bytes from the record buffer.
   static void decode_member(const TABLE *table, const uchar *buf,
                             const uchar **m, uint *len);
@@ -307,4 +316,6 @@ class ha_zset : public handler {
   std::vector<ZsetLSM::Key> rev_buf_;  ///< Reverse scan buffer
   size_t rev_pos_ = 0;                 ///< Reverse scan position
   uint64 scan_sequence_;  ///< Scan snapshot watermark (~0ULL = no filtering)
+  int active_scans_ = 0;  ///< In-flight rnd/index scans
+  bool flush_pending_ = false;  ///< Flush deferred until the scans end
 };
