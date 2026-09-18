@@ -30,7 +30,9 @@ handlerton *zset_hton;
 extern ulong zset_wal_fsync;
 
 // Flush the memtable when it holds more internal keys than this.
-static constexpr size_t kMemtableLimit = 100'000;
+// Registered as zset_memtable_limit; the default matches the historical
+// hard-coded limit.
+static ulong zset_memtable_limit = 100'000;
 
 // Table file extensions, for DROP/repair discovery.
 static const char *zset_file_exts[] = {".zlog", nullptr};
@@ -78,7 +80,17 @@ static MYSQL_SYSVAR_ULONG(wal_fsync, zset_wal_fsync, PLUGIN_VAR_RQCMDARG,
                           "WAL fsync policy: 0=every write, 1=batched", nullptr,
                           nullptr, 0, 0, 1, 0);
 
-static SYS_VAR *zset_system_variables[] = {MYSQL_SYSVAR(wal_fsync), nullptr};
+// Flush the memtable to an sstable once it holds more than this many
+// internal keys. Exposed so tests (and tuning) can trigger a flush
+// without loading 100K rows.
+static MYSQL_SYSVAR_ULONG(memtable_limit, zset_memtable_limit,
+                          PLUGIN_VAR_RQCMDARG,
+                          "Flush the memtable above this many internal keys",
+                          nullptr, nullptr, 100000, 1, 1000000000, 0);
+
+static SYS_VAR *zset_system_variables[] = {MYSQL_SYSVAR(wal_fsync),
+                                           MYSQL_SYSVAR(memtable_limit),
+                                           nullptr};
 
 struct st_mysql_storage_engine zset_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
@@ -617,7 +629,7 @@ void ha_zset::fill_record(uchar *buf, const uchar *member, uint len,
 }
 
 void ha_zset::maybe_flush() {
-  if (share_->lsm_.mem_size() > kMemtableLimit) {
+  if (share_->lsm_.mem_size() > static_cast<size_t>(zset_memtable_limit)) {
     // A flush clears the memtable, freeing the nodes an in-flight scan
     // cursor may still point at. Defer it until the scans finish.
     if (active_scans_ > 0) {

@@ -142,6 +142,15 @@ check "post-flush member point lookup" "100001" -e "SELECT score FROM ztest.t WH
 check "pre-load member still intact" "0.5" -e "SELECT score FROM ztest.t WHERE member='apple';"
 check "descending range top" "m_0110000" -e "SELECT member FROM ztest.t ORDER BY score DESC LIMIT 1;"
 
+# 9b. Full-table UPDATE over flushed rows: each row is updated exactly
+#     once and the scores round-trip (regression: per-row point scans
+#     made this O(N^2), and a mid-scan flush crashed the scan).
+sql "UPDATE -10 (flushed rows)" -e "UPDATE ztest.t SET score = score - 10;"
+check "after update -10" "-9" -e "SELECT score FROM ztest.t WHERE member='m_0000001';"
+sql "UPDATE +10 (flushed rows)" -e "UPDATE ztest.t SET score = score + 10;"
+check "after update +10" "1" -e "SELECT score FROM ztest.t WHERE member='m_0000001';"
+check "row count after updates" "110004" -e "SELECT COUNT(*) FROM ztest.t;"
+
 # 10. Crash recovery: kill -9, restart, data must survive (WAL replay).
 kill -9 "$MYSQLD_PID" 2>/dev/null
 wait "$MYSQLD_PID" 2>/dev/null

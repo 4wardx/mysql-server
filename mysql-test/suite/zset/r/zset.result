@@ -240,3 +240,50 @@ e
 f
 z
 DROP TABLE t1, t2;
+DROP TABLE IF EXISTS t1;
+SET GLOBAL zset_memtable_limit = 1000;
+CREATE TABLE t1 (
+member VARBINARY(255) NOT NULL,
+score  DOUBLE NOT NULL,
+PRIMARY KEY (member),
+KEY idx_score (score, member)
+) ENGINE=ZSET;
+SET SESSION cte_max_recursion_depth = 2000;
+INSERT INTO t1 (member, score)
+WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 1005)
+SELECT CONCAT('m_', LPAD(n, 4, '0')), n FROM s;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+1005
+UPDATE t1 SET score = score - 10;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+1005
+SELECT member, score FROM t1
+WHERE member IN ('m_0001', 'm_1001', 'm_1005')
+ORDER BY member;
+member	score
+m_0001	-9
+m_1001	991
+m_1005	995
+UPDATE t1 SET score = score + 10;
+SELECT member, score FROM t1
+WHERE member IN ('m_0001', 'm_1001', 'm_1005')
+ORDER BY member;
+member	score
+m_0001	1
+m_1001	1001
+m_1005	1005
+UPDATE t1 SET score = score * 2 WHERE score BETWEEN 10 AND 12;
+SELECT member, score FROM t1
+WHERE member IN ('m_0010', 'm_0011', 'm_0012')
+ORDER BY member;
+member	score
+m_0010	20
+m_0011	22
+m_0012	24
+SELECT COUNT(*), MIN(score), MAX(score) FROM t1;
+COUNT(*)	MIN(score)	MAX(score)
+1005	1	1005
+DROP TABLE t1;
+SET GLOBAL zset_memtable_limit = 100000;

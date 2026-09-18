@@ -225,3 +225,61 @@ SELECT DISTINCT score FROM t1 ORDER BY score;
 SELECT member FROM t1 UNION SELECT member FROM t2 ORDER BY member;
 
 DROP TABLE t1, t2;
+
+#
+# UPDATE on a flushed (sstable-backed) table.
+#
+# A full-table UPDATE writes new versions while its scan is open. Two
+# bugs lived here: update_row did one merged point scan per row (O(N^2)
+# on flushed rows), and a mid-scan flush freed the memtable nodes the
+# scan cursor was walking. A small zset_memtable_limit flushes the rows
+# into an sstable without loading 100K rows.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+# The memtable limit is tunable; drop it so a flush happens after 1000
+# keys and the rest of the rows stay in the memtable.
+SET GLOBAL zset_memtable_limit = 1000;
+
+CREATE TABLE t1 (
+  member VARBINARY(255) NOT NULL,
+  score  DOUBLE NOT NULL,
+  PRIMARY KEY (member),
+  KEY idx_score (score, member)
+) ENGINE=ZSET;
+
+SET SESSION cte_max_recursion_depth = 2000;
+INSERT INTO t1 (member, score)
+  WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 1005)
+  SELECT CONCAT('m_', LPAD(n, 4, '0')), n FROM s;
+
+# 1005 rows: one flush at the limit, the rest in the memtable.
+SELECT COUNT(*) FROM t1;
+
+# Full-table decrease then increase: every row is updated exactly once
+# and the scores round-trip.
+UPDATE t1 SET score = score - 10;
+SELECT COUNT(*) FROM t1;
+SELECT member, score FROM t1
+  WHERE member IN ('m_0001', 'm_1001', 'm_1005')
+  ORDER BY member;
+
+UPDATE t1 SET score = score + 10;
+SELECT member, score FROM t1
+  WHERE member IN ('m_0001', 'm_1001', 'm_1005')
+  ORDER BY member;
+
+# Index-path range update on flushed rows.
+UPDATE t1 SET score = score * 2 WHERE score BETWEEN 10 AND 12;
+SELECT member, score FROM t1
+  WHERE member IN ('m_0010', 'm_0011', 'm_0012')
+  ORDER BY member;
+
+# Aggregate over the updated flushed table.
+SELECT COUNT(*), MIN(score), MAX(score) FROM t1;
+
+DROP TABLE t1;
+SET GLOBAL zset_memtable_limit = 100000;
