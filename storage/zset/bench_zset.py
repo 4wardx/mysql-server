@@ -13,9 +13,10 @@
 # Fairness:
 #   * The same schema, same SQL and the same server are used for both
 #     engines, and each insert workload starts from a fresh table.
-#   * Durability is aligned: by default both engines run WITHOUT per-
-#     commit fsync (InnoDB innodb_flush_log_at_trx_commit=0, ZSET
-#     zset_wal_fsync=0). Pass --durable to fsync on BOTH engines.
+#   * Durability is aligned: by default both engines run WITHOUT fsync
+#     (InnoDB innodb_flush_log_at_trx_commit=0, ZSET zset_wal_fsync=0).
+#     Pass --durable to fsync on BOTH engines (ZSET fsyncs every write,
+#     InnoDB every commit).
 #   * Table setup (DROP/CREATE) happens before timing, not inside it.
 #   * Lookups are batched into one IN(...) query so the mysql CLI
 #     startup cost is amortized away.
@@ -364,16 +365,16 @@ def main():
 
     # Align durability so the comparison is apples-to-apples.
     if args.durable:
-        # Both engines fsync: InnoDB per commit, ZSET per write.
-        durability = "fsync on BOTH (InnoDB per-commit, ZSET per-write)"
+        # Both engines fsync.
+        durability = "fsync on BOTH (ZSET per write, InnoDB per commit)"
         pre = (
             "SET GLOBAL zset_wal_fsync=1; "
             "SET GLOBAL innodb_flush_log_at_trx_commit=1; "
             "SET GLOBAL sync_binlog=1; "
         )
     else:
-        # Both engines skip per-commit fsync: raw engine throughput.
-        durability = "fsync off on BOTH (InnoDB per-commit fsync disabled)"
+        # Neither engine fsyncs per write/commit: raw engine throughput.
+        durability = "fsync off on BOTH (no per-write/per-commit fsync)"
         pre = (
             "SET GLOBAL zset_wal_fsync=0; "
             "SET GLOBAL innodb_flush_log_at_trx_commit=0; "

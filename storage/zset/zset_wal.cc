@@ -7,8 +7,9 @@
 // Header size: magic(2) + type(1) + sequence(8).
 static constexpr size_t kWalHeaderLen = 11;
 
-// fsync policy: 0 = fsync after every record, 1 = batched by the caller.
-ulong zset_wal_fsync = 0;
+// fsync policy: 1 = fsync after every record (durable, the default),
+// 0 = skip fsync and leave durability to the caller.
+ulong zset_wal_fsync = 1;
 
 Zset_wal::~Zset_wal() {
   if (fd_ >= 0) {
@@ -91,7 +92,7 @@ int Zset_wal::append(double score, const uchar *member, uint len,
     return 1;
   }
 
-  if (zset_wal_fsync == 0 && my_sync(fd_, MYF(MY_WME))) {
+  if (zset_wal_fsync != 0 && my_sync(fd_, MYF(MY_WME))) {
     return 1;
   }
 
@@ -111,7 +112,7 @@ int Zset_wal::append_clear() {
     return 1;
   }
 
-  if (zset_wal_fsync == 0 && my_sync(fd_, MYF(MY_WME))) {
+  if (zset_wal_fsync != 0 && my_sync(fd_, MYF(MY_WME))) {
     return 1;
   }
 

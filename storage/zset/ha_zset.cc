@@ -76,9 +76,10 @@ static int zset_deinit_func(void *p [[maybe_unused]]) {
 // Plugin registration
 // ============================================================================
 
-static MYSQL_SYSVAR_ULONG(wal_fsync, zset_wal_fsync, PLUGIN_VAR_RQCMDARG,
-                          "WAL fsync policy: 0=every write, 1=batched", nullptr,
-                          nullptr, 0, 0, 1, 0);
+static MYSQL_SYSVAR_ULONG(
+    wal_fsync, zset_wal_fsync, PLUGIN_VAR_RQCMDARG,
+    "WAL fsync policy: 1=fsync every write (default), 0=skip fsync", nullptr,
+    nullptr, 1, 0, 1, 0);
 
 // Flush the memtable to an sstable once it holds more than this many
 // internal keys. Exposed so tests (and tuning) can trigger a flush
