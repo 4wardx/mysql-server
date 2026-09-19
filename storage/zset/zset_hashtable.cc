@@ -22,3 +22,13 @@ void ZsetHashtable::remove(const uchar *member, uint len) {
 void ZsetHashtable::clear() { entries_.clear(); }
 
 size_t ZsetHashtable::count() const { return entries_.size(); }
+
+size_t ZsetHashtable::count_live() const {
+  size_t n = 0;
+  for (const auto &entry : entries_) {
+    if (entry.second->type == ZsetType::kPut) {
+      n++;
+    }
+  }
+  return n;
+}

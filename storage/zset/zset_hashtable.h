@@ -29,8 +29,11 @@ class ZsetHashtable {
   // Clear all entries.
   void clear();
 
-  // Number of entries.
+  // Number of entries, tombstones included.
   size_t count() const;
+
+  // Number of entries whose newest version is a PUT.
+  size_t count_live() const;
 
  private:
   std::unordered_map<std::string, ZNode *> entries_;  // Member -> node

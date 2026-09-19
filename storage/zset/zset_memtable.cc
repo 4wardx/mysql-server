@@ -11,13 +11,16 @@ ZNode *ZsetMemTable::put(double score, const uchar *member, uint len,
 
 void ZsetMemTable::tombstone(double score, const uchar *member, uint len,
                              uint64 sequence) {
-  skiplist_.insert(score, member, len, sequence, ZsetType::kDelete);
-  hashtable_.remove(member, len);
+  ZNode *node =
+      skiplist_.insert(score, member, len, sequence, ZsetType::kDelete);
+  // Keep the newest version in the hash, tombstone included, so callers
+  // can tell a deleted member from one that never existed.
+  hashtable_.insert(member, len, node);
 }
 
 bool ZsetMemTable::get(const uchar *member, uint len, double *score) const {
   ZNode *node = hashtable_.lookup(member, len);
-  if (node == nullptr) {
+  if (node == nullptr || node->type != ZsetType::kPut) {
     return false;
   }
   *score = node->score;
@@ -28,7 +31,7 @@ ZNode *ZsetMemTable::lookup(const uchar *member, uint len) const {
   return hashtable_.lookup(member, len);
 }
 
-size_t ZsetMemTable::count() const { return hashtable_.count(); }
+size_t ZsetMemTable::count() const { return hashtable_.count_live(); }
 
 void ZsetMemTable::clear() {
   hashtable_.clear();

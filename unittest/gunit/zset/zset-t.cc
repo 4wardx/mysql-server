@@ -219,7 +219,11 @@ TEST(ZsetMemTableTest, TombstoneVoidsLiveView) {
   mem.tombstone(1.0, m, len, 2);
   EXPECT_EQ(mem.count(), 0U);
   EXPECT_FALSE(mem.get(m, len, &score));
-  EXPECT_EQ(mem.lookup(m, len), nullptr);
+  // The hash keeps the newest version, so a deleted member is told apart
+  // from one that never existed by the tombstone node it returns.
+  ZNode *deleted = mem.lookup(m, len);
+  ASSERT_NE(deleted, nullptr);
+  EXPECT_EQ(deleted->type, ZsetType::kDelete);
 
   // Both nodes still live in the skiplist (pure LSM keeps history).
   EXPECT_EQ(mem.skiplist()->count(), 2U);
@@ -1373,4 +1377,161 @@ TEST(ZsetSSTableTest, FilterSkipsAbsent) {
   EXPECT_FALSE(r.may_contain(m, len));
   r.close();
   unlink(path);
+}
+
+// The member index resolves a member's newest version without a scan.
+TEST(ZsetSSTableTest, MemberIndexFind) {
+  const char *path = "/tmp/zset_sst_member.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  uint len;
+  const uchar *m;
+
+  // a: put, tombstone (re-score), put, tombstone (delete). b: one put.
+  m = member("a", &len);
+  ASSERT_EQ(w.append(1.0, m, len, 1, ZsetType::kPut), 0);
+  ASSERT_EQ(w.append(1.0, m, len, 2, ZsetType::kDelete), 0);
+  ASSERT_EQ(w.append(5.0, m, len, 3, ZsetType::kPut), 0);
+  ASSERT_EQ(w.append(5.0, m, len, 4, ZsetType::kDelete), 0);
+  m = member("b", &len);
+  ASSERT_EQ(w.append(2.0, m, len, 5, ZsetType::kPut), 0);
+  ASSERT_EQ(w.finish(), 0);
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+
+  uint64 seq;
+  ZsetType type;
+  double score;
+
+  // a: the newest version is the seq-4 tombstone.
+  m = member("a", &len);
+  ASSERT_TRUE(r.find_member(m, len, &seq, &type, &score));
+  EXPECT_EQ(seq, 4U);
+  EXPECT_EQ(type, ZsetType::kDelete);
+
+  // b: the seq-5 put, with its score.
+  m = member("b", &len);
+  ASSERT_TRUE(r.find_member(m, len, &seq, &type, &score));
+  EXPECT_EQ(seq, 5U);
+  EXPECT_EQ(type, ZsetType::kPut);
+  EXPECT_EQ(score, 2.0);
+
+  // A member that is not in the file.
+  m = member("zzz", &len);
+  EXPECT_FALSE(r.find_member(m, len, &seq, &type, &score));
+
+  r.close();
+  unlink(path);
+}
+
+// The member index spans data blocks: members in later blocks resolve.
+TEST(ZsetSSTableTest, MemberIndexMultiBlock) {
+  const char *path = "/tmp/zset_sst_mindex.sst";
+  unlink(path);
+  ZsetSSTableWriter w;
+  ASSERT_EQ(w.open(path), 0);
+  const int kNum = 5000;  // several 4K blocks
+  for (int i = 0; i < kNum; i++) {
+    string mb = "m_" + std::to_string(i);
+    ASSERT_EQ(w.append(static_cast<double>(i),
+                       reinterpret_cast<const uchar *>(mb.data()), mb.size(), 1,
+                       ZsetType::kPut),
+              0);
+  }
+  ASSERT_EQ(w.finish(), 0);
+  EXPECT_GT(w.size(), 4096U);
+
+  ZsetSSTableReader r;
+  ASSERT_EQ(r.open(path), 0);
+  const int probes[] = {0, 1, 1234, kNum - 2, kNum - 1};
+  for (int i : probes) {
+    string mb = "m_" + std::to_string(i);
+    uint64 seq;
+    ZsetType type;
+    double score;
+    ASSERT_TRUE(r.find_member(reinterpret_cast<const uchar *>(mb.data()),
+                              mb.size(), &seq, &type, &score))
+        << "member " << i;
+    EXPECT_EQ(score, static_cast<double>(i));
+    EXPECT_EQ(type, ZsetType::kPut);
+  }
+
+  string miss = "not_a_member";
+  uint64 seq;
+  ZsetType type;
+  double score;
+  EXPECT_FALSE(r.find_member(reinterpret_cast<const uchar *>(miss.data()),
+                             miss.size(), &seq, &type, &score));
+
+  r.close();
+  unlink(path);
+}
+
+// Point reads over flushed rows resolve through the member index:
+// present, deleted and absent members all answer without a scan.
+TEST(ZsetLSMTest, GetAfterFlush) {
+  const char *name = "/tmp/zset_lsm_getflush";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);
+  lsm_put(&lsm, "b", 2.0);
+  lsm_put(&lsm, "c", 3.0);
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_del(&lsm, "b", 2.0);  // tombstone lands in the new memtable
+  lsm_put(&lsm, "d", 4.0);
+
+  double score;
+  ASSERT_TRUE(lsm_get(&lsm, "a", &score));
+  EXPECT_EQ(score, 1.0);
+  ASSERT_TRUE(lsm_get(&lsm, "c", &score));
+  EXPECT_EQ(score, 3.0);
+  EXPECT_FALSE(lsm_get(&lsm, "b", &score));    // deleted after the flush
+  EXPECT_FALSE(lsm_get(&lsm, "zzz", &score));  // never existed
+  ASSERT_TRUE(lsm_get(&lsm, "d", &score));     // only in the memtable
+  EXPECT_EQ(score, 4.0);
+
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// A tombstone that only the sstable holds marks the member as deleted.
+TEST(ZsetLSMTest, GetFlushedTombstone) {
+  const char *name = "/tmp/zset_lsm_getdel";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);
+  lsm_put(&lsm, "b", 2.0);
+  lsm_del(&lsm, "a", 1.0);
+  ASSERT_EQ(lsm.flush(), 0);  // the tombstone reaches the sstable
+
+  double score;
+  EXPECT_FALSE(lsm_get(&lsm, "a", &score));  // newest version is a tombstone
+  ASSERT_TRUE(lsm_get(&lsm, "b", &score));
+  EXPECT_EQ(score, 2.0);
+  lsm.close();
+  lsm_cleanup(name);
+}
+
+// The newest version wins when a member spans several sstables.
+TEST(ZsetLSMTest, GetAcrossSstables) {
+  const char *name = "/tmp/zset_lsm_getmulti";
+  ZsetLSM lsm;
+  lsm_open_clean(&lsm, name);
+  lsm_put(&lsm, "a", 1.0);
+  lsm_put(&lsm, "b", 2.0);
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_put(&lsm, "a", 10.0);  // newer version in the memtable
+  lsm_del(&lsm, "b", 2.0);   // newer tombstone in the memtable
+  ASSERT_EQ(lsm.flush(), 0);
+  lsm_put(&lsm, "a", 100.0);  // newest version, currently in the memtable
+
+  double score;
+  ASSERT_TRUE(lsm_get(&lsm, "a", &score));
+  EXPECT_EQ(score, 100.0);
+  EXPECT_FALSE(lsm_get(&lsm, "b", &score));
+
+  lsm.close();
+  lsm_cleanup(name);
 }

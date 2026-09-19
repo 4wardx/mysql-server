@@ -55,7 +55,8 @@ class ZsetMemTable {
   // Live score for the member, or false if absent or deleted.
   bool get(const uchar *member, uint len, double *score) const;
 
-  // Live node for the member, or nullptr if absent or deleted.
+  // Newest version for the member (PUT or DELETE tombstone), or
+  // nullptr if the member has no version in this memtable.
   ZNode *lookup(const uchar *member, uint len) const;
 
   // Number of live rows.

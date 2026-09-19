@@ -121,36 +121,45 @@ int ZsetLSM::clear() {
 }
 
 bool ZsetLSM::get(const uchar *member, uint len, double *score) const {
-  // Fast path: the row is still in the memtable.
-  if (mem_->get(member, len, score)) {
+  // The memtable keeps the newest version of every member it has seen,
+  // tombstones included, so it alone decides when it knows the member.
+  const ZNode *node = mem_->lookup(member, len);
+  if (node != nullptr) {
+    if (node->type != ZsetType::kPut) {
+      return false;  // newest version is a tombstone
+    }
+    *score = node->score;
     return true;
   }
 
-  // The row may live in an sstable. Skip the files whose bloom filter
-  // rules the member out; only when some file may hold it do we scan the
-  // merged live view.
-  bool any_may = false;
+  // Otherwise the sstables decide. The bloom filter rejects absent
+  // members, then the member index points at the blocks that can hold
+  // the member, so no file is ever scanned end to end.
+  bool found = false;
+  uint64 best_sequence = 0;
+  ZsetType best_type = ZsetType::kPut;
+  double best_score = 0;
   for (ZsetSSTableReader *r : ssts_) {
-    if (r->may_contain(member, len)) {
-      any_may = true;
-      break;
+    if (!r->may_contain(member, len)) {
+      continue;
+    }
+
+    uint64 sequence;
+    ZsetType type;
+    double member_score;
+    if (r->find_member(member, len, &sequence, &type, &member_score) &&
+        (!found || sequence > best_sequence)) {
+      found = true;
+      best_sequence = sequence;
+      best_type = type;
+      best_score = member_score;
     }
   }
-  if (!any_may) {
-    return false;
-  }
 
-  Iterator it;
-  it.seekToFirst(this, ~0ULL);
-  while (it.valid()) {
-    const Key &k = it.key();
-    if (k.member.size() == len && memcmp(k.member.data(), member, len) == 0) {
-      *score = k.score;
-      return true;
-    }
-    it.next();
+  if (found && best_type == ZsetType::kPut) {
+    *score = best_score;
+    return true;
   }
-
   return false;
 }
 

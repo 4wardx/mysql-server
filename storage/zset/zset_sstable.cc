@@ -8,10 +8,11 @@
 namespace {
 
 // Footer: index_offset(8) | index_len(8) | filter_offset(8) |
-// filter_len(8) | magic(4) | version(4) | pad(4).
-constexpr size_t kFooterLen = 40;
+// filter_len(8) | member_index_offset(8) | member_index_len(8) |
+// magic(4) | version(4).
+constexpr size_t kFooterLen = 56;
 constexpr uint32_t kMagic = 0x5A53;
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
 constexpr size_t kScoreLen = 8;
 constexpr size_t kMemberLenLen = 2;
@@ -155,6 +156,16 @@ int ZsetSSTableWriter::append(double score, const uchar *member, uint len,
   ZsetBloomFilter::hash(member, len, &h1, &h2);
   member_hashes_.push_back({h1, h2});
 
+  // Member index: remember which block holds the member (one entry per
+  // member per block; adjacent appends of the same member are merged).
+  const uint32_t block = static_cast<uint32_t>(index_.size() - 1);
+  const uint32_t hash = static_cast<uint32_t>(h1);
+  if (hash != last_index_hash_ || block != last_index_block_) {
+    member_index_.push_back({hash, block});
+    last_index_hash_ = hash;
+    last_index_block_ = block;
+  }
+
   // Append the length-prefixed internal key at the end of the block.
   block_.resize(block_len_ + entry_size);
   block_[block_len_] = static_cast<uchar>(key.size() >> 8);
@@ -207,13 +218,33 @@ int ZsetSSTableWriter::finish() {
   }
   size_ += fb.size();
 
+  // Member index block: (hash(4) | block(4)) entries sorted by hash, so
+  // a point lookup binary-searches to the blocks that can hold a member.
+  std::sort(member_index_.begin(), member_index_.end(),
+            [](const ZsetMemberIndexEntry &a, const ZsetMemberIndexEntry &b) {
+              return a.hash != b.hash ? a.hash < b.hash : a.block < b.block;
+            });
+  const uint64_t member_index_offset = size_;
+  std::vector<uchar> mb;
+  append_be32(&mb, static_cast<uint32_t>(member_index_.size()));
+  for (const ZsetMemberIndexEntry &e : member_index_) {
+    append_be32(&mb, e.hash);
+    append_be32(&mb, e.block);
+  }
+  if (my_write(fd_, mb.data(), mb.size(), MYF(MY_WME)) != mb.size()) {
+    return 1;
+  }
+  size_ += mb.size();
+
   uchar footer[kFooterLen] = {0};
   append_be64(footer, 0, index_offset);
   append_be64(footer, 8, ib.size());
   append_be64(footer, 16, filter_offset);
   append_be64(footer, 24, fb.size());
-  append_be32(footer, 32, kMagic);
-  append_be32(footer, 36, kVersion);
+  append_be64(footer, 32, member_index_offset);
+  append_be64(footer, 40, mb.size());
+  append_be32(footer, 48, kMagic);
+  append_be32(footer, 52, kVersion);
   if (my_write(fd_, footer, kFooterLen, MYF(MY_WME)) != kFooterLen) {
     return 1;
   }
@@ -283,7 +314,7 @@ int ZsetSSTableReader::open(const char *path) {
 
   uchar footer[kFooterLen];
   if (my_read(fd_, footer, kFooterLen, MYF(MY_WME)) != kFooterLen ||
-      read_be32(footer + 32) != kMagic) {
+      read_be32(footer + 48) != kMagic || read_be32(footer + 52) != kVersion) {
     close();
     return 1;
   }
@@ -291,6 +322,8 @@ int ZsetSSTableReader::open(const char *path) {
   const uint64_t index_len = read_be64(footer + 8);
   const uint64_t filter_offset = read_be64(footer + 16);
   const uint64_t filter_len = read_be64(footer + 24);
+  const uint64_t member_index_offset = read_be64(footer + 32);
+  const uint64_t member_index_len = read_be64(footer + 40);
 
   // The index block is small; load it in one read.
   std::vector<uchar> ib(index_len);
@@ -337,11 +370,61 @@ int ZsetSSTableReader::open(const char *path) {
     return 1;
   }
 
+  // Load the member index block: count(4) then (hash(4) | block(4)) each.
+  std::vector<uchar> mb(member_index_len);
+  if (member_index_len > 0 &&
+      (my_seek(fd_, member_index_offset, MY_SEEK_SET, MYF(0)) ==
+           MY_FILEPOS_ERROR ||
+       my_read(fd_, mb.data(), mb.size(), MYF(MY_WME)) != mb.size())) {
+    close();
+    return 1;
+  }
+  if (mb.size() >= 4) {
+    const uint32_t count = read_be32(mb.data());
+    size_t mpos = 4;
+    for (uint32_t i = 0; i < count; i++) {
+      if (mpos + 8 > mb.size()) {
+        close();
+        return 1;
+      }
+      ZsetMemberIndexEntry e;
+      e.hash = read_be32(&mb[mpos]);
+      mpos += 4;
+      e.block = read_be32(&mb[mpos]);
+      mpos += 4;
+      member_index_.push_back(e);
+    }
+  }
+
   return 0;
 }
 
 bool ZsetSSTableReader::may_contain(const uchar *member, uint len) const {
   return filter_.may_contain(member, len);
+}
+
+bool ZsetSSTableReader::find_member(const uchar *member, uint len,
+                                    uint64 *sequence, ZsetType *type,
+                                    double *score) {
+  // Every version of the member has an index entry, so a hash with no
+  // entry means the member is absent from this file.
+  uint64 h1, h2;
+  ZsetBloomFilter::hash(member, len, &h1, &h2);
+  const uint32_t target = static_cast<uint32_t>(h1);
+
+  auto it = std::lower_bound(
+      member_index_.begin(), member_index_.end(), target,
+      [](const ZsetMemberIndexEntry &e, uint32_t h) { return e.hash < h; });
+
+  bool found = false;
+  for (; it != member_index_.end() && it->hash == target; ++it) {
+    if (!scan_block_for_member(it->block, member, len, sequence, type, score,
+                               &found)) {
+      return false;
+    }
+  }
+
+  return found;
 }
 
 void ZsetSSTableReader::close() {
@@ -519,4 +602,50 @@ size_t ZsetSSTableReader::find_block(double score, const uchar *member,
   }
 
   return lo == 0 ? 0 : lo - 1;
+}
+
+bool ZsetSSTableReader::scan_block_for_member(uint32_t block,
+                                              const uchar *member, uint len,
+                                              uint64 *sequence, ZsetType *type,
+                                              double *score, bool *found) {
+  if (block >= index_.size()) {
+    return false;
+  }
+
+  std::vector<uchar> buf;
+  if (!read_block(index_[block].offset, index_[block].length, &buf)) {
+    return false;
+  }
+
+  // Last 2 bytes are the restart count; entries precede the array.
+  const size_t restart_count = read_be16(&buf[buf.size() - 2]);
+  const size_t entries_len = buf.size() - 2 - 2 * restart_count;
+
+  size_t pos = 0;
+  while (pos + 2 <= entries_len) {
+    const uint16_t key_len = read_be16(&buf[pos]);
+    if (pos + 2 + key_len > entries_len) {
+      return false;
+    }
+    const uchar *key = &buf[pos + 2];
+
+    const uint16_t member_len = read_be16(key + kScoreLen);
+    if (member_len == len &&
+        memcmp(key + kScoreLen + kMemberLenLen, member, len) == 0) {
+      const uint64 seq =
+          ~read_be64(key + kScoreLen + kMemberLenLen + member_len);
+      const ZsetType t = static_cast<ZsetType>(
+          key[kScoreLen + kMemberLenLen + member_len + kSeqLen]);
+      if (!*found || seq > *sequence) {
+        *found = true;
+        *sequence = seq;
+        *type = t;
+        *score = zset_decode_score(read_be64(key));
+      }
+    }
+
+    pos += 2 + key_len;
+  }
+
+  return true;
 }

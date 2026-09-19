@@ -55,6 +55,14 @@ inline double zset_decode_score(uint64 encoded) {
   return score;
 }
 
+// One member index entry: truncated member hash -> data block number.
+// The reader scans just the blocks listed for a member's hash, so point
+// lookups never walk the whole file.
+struct ZsetMemberIndexEntry {
+  uint32_t hash;
+  uint32_t block;
+};
+
 class ZsetSSTableWriter {
  public:
   ZsetSSTableWriter();
@@ -101,7 +109,12 @@ class ZsetSSTableWriter {
 
   std::vector<IndexEntry> index_;  // Per-block index entries
   std::vector<std::pair<uint64, uint64>> member_hashes_;  // For the filter
-  bool finished_ = false;                                 // finish() completed
+  // Member index: (truncated hash, block) pairs, one per member per
+  // block that holds it, deduplicated on adjacent appends.
+  std::vector<ZsetMemberIndexEntry> member_index_;
+  uint32_t last_index_hash_ = 0;     // Last recorded member hash
+  uint32_t last_index_block_ = ~0U;  // Last recorded block (sentinel: none)
+  bool finished_ = false;            // finish() completed
 };
 
 // Sequential and seeking read access to a written SST.
@@ -125,6 +138,12 @@ class ZsetSSTableReader {
 
   // True if the member may live in this sstable (bloom filter).
   bool may_contain(const uchar *member, uint len) const;
+
+  // Newest version of the member in this sstable, using the member index
+  // to read only the blocks that can hold it (no full scan). Returns
+  // false when the member has no version in this file.
+  bool find_member(const uchar *member, uint len, uint64 *sequence,
+                   ZsetType *type, double *score);
 
   // One decoded internal key.
   struct Entry {
@@ -182,9 +201,16 @@ class ZsetSSTableReader {
   size_t find_block(double score, const uchar *member, uint len,
                     uint64 sequence, ZsetType type) const;
 
-  ZsetBloomFilter filter_;         // Member bloom filter
-  File fd_ = -1;                   // Opened sstable fd
-  std::vector<IndexEntry> index_;  // Loaded index block
+  // Scan one data block for every version of the member, keeping the
+  // newest. Used by find_member.
+  bool scan_block_for_member(uint32_t block, const uchar *member, uint len,
+                             uint64 *sequence, ZsetType *type, double *score,
+                             bool *found);
+
+  ZsetBloomFilter filter_;                          // Member bloom filter
+  File fd_ = -1;                                    // Opened sstable fd
+  std::vector<IndexEntry> index_;                   // Loaded index block
+  std::vector<ZsetMemberIndexEntry> member_index_;  // Loaded member index
   std::unordered_map<uint64_t, std::vector<uchar>> block_cache_;  // Read blocks
 };
 
