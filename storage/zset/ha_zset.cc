@@ -88,9 +88,8 @@ static MYSQL_SYSVAR_ULONG(memtable_limit, zset_memtable_limit,
                           "Flush the memtable above this many internal keys",
                           nullptr, nullptr, 100000, 1, 1000000000, 0);
 
-static SYS_VAR *zset_system_variables[] = {MYSQL_SYSVAR(wal_fsync),
-                                           MYSQL_SYSVAR(memtable_limit),
-                                           nullptr};
+static SYS_VAR *zset_system_variables[] = {
+    MYSQL_SYSVAR(wal_fsync), MYSQL_SYSVAR(memtable_limit), nullptr};
 
 struct st_mysql_storage_engine zset_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
@@ -414,7 +413,6 @@ int ha_zset::rnd_init(bool) {
   DBUG_TRACE;
   scan_sequence_ = share_->lsm_.sequence();
   scan_.seekToFirst(&share_->lsm_, scan_sequence_);
-  active_scans_++;
   return 0;
 }
 
@@ -422,25 +420,11 @@ int ha_zset::index_init(uint idx, bool) {
   DBUG_TRACE;
   active_index = idx;
   scan_sequence_ = share_->lsm_.sequence();
-  active_scans_++;
-  return 0;
-}
-
-int ha_zset::index_end() {
-  DBUG_TRACE;
-  if (active_scans_ > 0) {
-    active_scans_--;
-  }
-  flush_pending_if_idle();
   return 0;
 }
 
 int ha_zset::rnd_end() {
   DBUG_TRACE;
-  if (active_scans_ > 0) {
-    active_scans_--;
-  }
-  flush_pending_if_idle();
   return 0;
 }
 
@@ -630,19 +614,6 @@ void ha_zset::fill_record(uchar *buf, const uchar *member, uint len,
 
 void ha_zset::maybe_flush() {
   if (share_->lsm_.mem_size() > static_cast<size_t>(zset_memtable_limit)) {
-    // A flush clears the memtable, freeing the nodes an in-flight scan
-    // cursor may still point at. Defer it until the scans finish.
-    if (active_scans_ > 0) {
-      flush_pending_ = true;
-      return;
-    }
-    share_->lsm_.flush();
-  }
-}
-
-void ha_zset::flush_pending_if_idle() {
-  if (flush_pending_ && active_scans_ == 0) {
-    flush_pending_ = false;
     share_->lsm_.flush();
   }
 }

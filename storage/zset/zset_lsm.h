@@ -1,6 +1,7 @@
 #ifndef ZSET_LSM_H
 #define ZSET_LSM_H
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -63,7 +64,7 @@ class ZsetLSM {
   uint64 sequence() const { return sequence_; }
 
   // Internal keys held in the memtable (drives the flush trigger).
-  size_t mem_size() const { return mem_.skiplist()->count(); }
+  size_t mem_size() const { return mem_->skiplist()->count(); }
 
   // A decoded read key, from either the memtable or an sstable.
   struct Key {
@@ -127,14 +128,20 @@ class ZsetLSM {
     void find_next_live();
 
     const ZsetLSM *lsm_ = nullptr;  // Owning engine core
-    uint64 max_sequence_ = ~0ULL;   // Snapshot watermark
-    std::vector<Source> sources_;   // One cursor per source
-    bool valid_ = false;  // True while key_ holds the current live key
-    Key key_;             // The current live key
+    // Memtable snapshot. Holding the shared_ptr keeps the memtable (and
+    // every ZNode the cursor points at) alive even if a flush replaces
+    // the live memtable mid-scan.
+    std::shared_ptr<ZsetMemTable> mem_;
+    uint64 max_sequence_ = ~0ULL;  // Snapshot watermark
+    std::vector<Source> sources_;  // One cursor per source
+    bool valid_ = false;           // True while key_ holds the current live key
+    Key key_;                      // The current live key
   };
 
  private:
-  ZsetMemTable mem_;  // Versioned memtable (skiplist + live-view hash)
+  // Versioned memtable (skiplist + live-view hash). Replaced, not
+  // cleared, by flush(): scans hold the previous one until they finish.
+  std::shared_ptr<ZsetMemTable> mem_;
   std::vector<ZsetSSTableReader *> ssts_;  // Loaded sstable readers
   Zset_wal wal_;                           // Write-ahead log
   uint64 sequence_ = 0;                    // Sequence counter for internal keys

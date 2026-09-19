@@ -7,7 +7,7 @@
 #include "my_sys.h"
 #include "storage/zset/zset_skiplist.h"
 
-ZsetLSM::ZsetLSM() = default;
+ZsetLSM::ZsetLSM() : mem_(std::make_shared<ZsetMemTable>()) {}
 
 ZsetLSM::~ZsetLSM() { close(); }
 
@@ -55,7 +55,7 @@ int ZsetLSM::open(const char *name) {
   if (wal_.open(wal_path) != 0) {
     return 1;
   }
-  wal_.replay(&mem_, &sequence_);
+  wal_.replay(mem_.get(), &sequence_);
 
   return 0;
 }
@@ -71,13 +71,13 @@ void ZsetLSM::close() {
 void ZsetLSM::put(double score, const uchar *member, uint len) {
   const uint64 sequence = ++sequence_;
   wal_.append(score, member, len, sequence, Zset_wal::Type::kPut);
-  mem_.put(score, member, len, sequence);
+  mem_->put(score, member, len, sequence);
 }
 
 void ZsetLSM::del(double score, const uchar *member, uint len) {
   const uint64 sequence = ++sequence_;
   wal_.append(score, member, len, sequence, Zset_wal::Type::kDelete);
-  mem_.tombstone(score, member, len, sequence);
+  mem_->tombstone(score, member, len, sequence);
 }
 
 int ZsetLSM::clear() {
@@ -85,7 +85,7 @@ int ZsetLSM::clear() {
     return 1;
   }
 
-  mem_.clear();
+  mem_->clear();
   for (ZsetSSTableReader *r : ssts_) {
     delete r;
   }
@@ -122,7 +122,7 @@ int ZsetLSM::clear() {
 
 bool ZsetLSM::get(const uchar *member, uint len, double *score) const {
   // Fast path: the row is still in the memtable.
-  if (mem_.get(member, len, score)) {
+  if (mem_->get(member, len, score)) {
     return true;
   }
 
@@ -182,8 +182,8 @@ int ZsetLSM::flush() {
     return 1;
   }
 
-  for (ZNode *n = mem_.skiplist()->first(); n != nullptr;
-       n = mem_.skiplist()->next(n)) {
+  for (ZNode *n = mem_->skiplist()->first(); n != nullptr;
+       n = mem_->skiplist()->next(n)) {
     if (w.append(n->score, n->member, n->member_len, n->sequence, n->type) !=
         0) {
       return 1;
@@ -202,9 +202,10 @@ int ZsetLSM::flush() {
 
   ssts_.push_back(r);
 
-  // Drop the memtable (and its live-view hash); reads now come from the
-  // sstables via the merged iterator.
-  mem_.clear();
+  // Replace the memtable: reads now come from the sstables via the
+  // merged iterator. Active scans keep the previous one alive through
+  // their shared_ptr snapshot.
+  mem_ = std::make_shared<ZsetMemTable>();
 
   // Reset the log: its records are now safe in the sstable.
   wal_.reset();
@@ -222,7 +223,8 @@ void ZsetLSM::Iterator::seekToFirst(const ZsetLSM *lsm, uint64 max_seq) {
   sources_.clear();
   sources_.resize(1 + lsm_->ssts_.size());
   sources_[0].sst_index = 0;
-  sources_[0].node = lsm_->mem_.skiplist()->first();
+  mem_ = lsm_->mem_;
+  sources_[0].node = mem_->skiplist()->first();
 
   for (size_t i = 0; i < lsm_->ssts_.size(); i++) {
     Source &s = sources_[i + 1];
@@ -287,8 +289,7 @@ ZsetLSM::Key ZsetLSM::Iterator::current_key(const Source &s) const {
 
 void ZsetLSM::Iterator::advance(Source *s) {
   if (s->sst_index == 0) {
-    s->node =
-        s->node == nullptr ? nullptr : lsm_->mem_.skiplist()->next(s->node);
+    s->node = s->node == nullptr ? nullptr : mem_->skiplist()->next(s->node);
   } else {
     s->sst.next();
   }
@@ -343,7 +344,8 @@ void ZsetLSM::Iterator::seek_sources(double score, const uchar *member,
                                      uint len, uint64 sequence, ZsetType type) {
   // Memtable: the skiplist cursor seeks to the first internal key >= the
   // target at max seq.
-  ZsetSkiplist::Cursor cur(lsm_->mem_.skiplist());
+  mem_ = lsm_->mem_;
+  ZsetSkiplist::Cursor cur(mem_->skiplist());
   cur.seekTo(score, member, len);
   sources_[0].node = cur.valid() ? cur.current() : nullptr;
 
